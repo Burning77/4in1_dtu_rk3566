@@ -26,7 +26,7 @@
 #define LORA_DATA 5
 #define FIFO_SIZE (16 * 1024) // 必须是2的幂次方
 
-#define EG_MSG_LEN 2048
+#define EG_MSG_LEN 1024
 #define EG_MAX_HEX_LEN (EG_MSG_LEN * 2 + 256)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define LORA_MESH_GATEWAY 0x01
@@ -92,4 +92,7 @@ uint32_t log_next_frame_id(void);
 int compact_log_file(const char *path, off_t *offset, int keep_frames);
 time_t monotonic_sec(void);
 void trim_log_file_by_size(const char *path);
+int data_separator(const char *hex_str,
+                   unsigned char *out_bytes,
+                   int max_len);
 #endif

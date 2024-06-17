@@ -78,7 +78,7 @@ static int main_pack_pending_until(const char **paths,
                                    int *entry_count)
 {
     int hex_len = 0;
-
+    int packed_raw_len = 0;
     memcpy(pending_offsets, offsets, sizeof(off_t) * MAIN_PATH_COUNT);
 
     hex_buf[0] = '\0';
@@ -126,7 +126,8 @@ static int main_pack_pending_until(const char **paths,
 
             if (hex_len + comma_len + need_hex > max_hex_len)
                 break;
-
+            if (packed_raw_len + comma_len + line_raw_len > raw_buf_size)
+                break;
             if (*entry_count > 0)
                 hex_buf[hex_len++] = ',';
 
@@ -140,6 +141,7 @@ static int main_pack_pending_until(const char **paths,
             }
 
             hex_buf[hex_len] = '\0';
+            packed_raw_len += comma_len + line_raw_len;
             (*entry_count)++;
             pending_offsets[i] = line_end;
         }
@@ -150,7 +152,7 @@ static int main_pack_pending_until(const char **paths,
     if (*entry_count == 0)
         return 0;
 
-    *raw_len = hex_to_bytes(hex_buf, raw_buf, raw_buf_size);
+    *raw_len = data_separator(hex_buf, raw_buf, raw_buf_size);
     return (*raw_len > 0) ? 0 : -1;
 }
 static int main_pack_pending(const char **paths,
@@ -177,10 +179,10 @@ static int main_pack_pending(const char **paths,
         return 0;
     }
 
-    *raw_len = hex_to_bytes(hex_buf, raw_buf, raw_buf_size);
+    *raw_len = data_separator(hex_buf, raw_buf, raw_buf_size);
     return (*raw_len > 0) ? 0 : -1;
 }
-static void main_wait_for_data_wakeup(unsigned int *seen_seq, int timeout_sec)
+static void main_data_wakeup(unsigned int *seen_seq, int timeout_sec)
 {
     struct timespec ts;
 
@@ -815,30 +817,35 @@ void *receive_thread(void *arg)
 }
 void *serial_send_thread(void *arg)
 {
-    const char *test = "Hello from rs232!\r\n";
+    uint16_t crc = 0xffff;
+    uint8_t level_gage[8] = {0x07, 0x03, 0x00, 0x14, 0x00, 0x04};
+    crc = crc16(level_gage, 6);
+    level_gage[6] = crc & 0xFF;
+    level_gage[7] = (crc >> 8) & 0xFF;
+    printf("crc %x\r\n", crc);
     // 注意：不再从此线程发送 EG 命令，避免与 main_send_thread 的 eg_init() 冲突
-    // while (!stop_flag)
-    // {
-    //     if (interruptible_sleep(SEND_INTERVAL) < 0)
-    //         break;
+    while (!stop_flag)
+    {
+        loRa_Para_t cfg;
+        lora_cfg_get(&cfg);
+        if (cfg.mesh_type == LORA_MESH_GATEWAY)
+        {
+            sleep(1);
+            continue;
+        }
+        if (interruptible_sleep(SEND_INTERVAL) < 0)
+            break;
 
-    //     printf("[SEND] Sending command...\n");
-    //     int resualt = data_send(test, strlen(test), RS232_DEV);
-    //     int ret = data_send(CMD_STRING, strlen(CMD_STRING), RS485_DEV);
-    //     int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
-    //     if (resualt < 0)
-    //     {
-    //         perror("rs232_send");
-    //     }
-    //     if (ret < 0)
-    //     {
-    //         perror("rs485_send");
-    //     }
-    //     if (res_bd < 0)
-    //     {
-    //         perror("bd_send");
-    //     }
-    // }
+        printf("[SEND] Sending command...\n");
+        // int resualt = data_send(level_gage, sizeof(level_gage), RS232_DEV);
+        int ret = data_send(level_gage, sizeof(level_gage), RS485_DEV);
+        // int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
+        if (ret < 0)
+        {
+            perror("rs485_send");
+        }
+        sleep(5);
+    }
     return NULL;
 }
 void *read_rtc_thread(void *arg)
@@ -1421,6 +1428,31 @@ void *main_send_thread(void *arg)
     time_t bd_power_hold_until = 0;
     while (!stop_flag)
     {
+        loRa_Para_t cfg;
+        lora_cfg_get(&cfg);
+        if (cfg.mesh_type == LORA_MESH_NODE)
+        {
+            for (int i = 0; i < MAIN_PATH_COUNT; i++)
+            {
+                FILE *fp = fopen(paths[i], "r");
+                if (!fp)
+                    continue;
+
+                if (fseeko(fp, 0, SEEK_END) == 0)
+                    offsets[i] = ftello(fp);
+
+                fclose(fp);
+            }
+            save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
+            if (eg_power_is_on() || bd_power_is_on() || eg_connected || eg_initialized)
+            {
+                main_all_power_down(&eg_initialized,
+                                    &eg_connected,
+                                    &eg_power_generation_seen);
+            }
+            main_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+            continue;
+        }
         switch (state)
         {
         case MAIN_ST_IDLE:
@@ -1431,7 +1463,7 @@ void *main_send_thread(void *arg)
                                   &raw_len, &entry_count) != 0)
             {
                 printf("[MAIN] pack failed\n");
-                main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+                main_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
                 break;
             }
 
@@ -1662,7 +1694,7 @@ void *main_send_thread(void *arg)
             if (wait_sec > MAIN_SEND_RETRY_WAIT_SEC)
                 wait_sec = MAIN_SEND_RETRY_WAIT_SEC;
 
-            main_wait_for_data_wakeup(&wakeup_seq_seen, wait_sec);
+            main_data_wakeup(&wakeup_seq_seen, wait_sec);
 
             state = MAIN_ST_BD_WAIT;
             break;
@@ -1679,7 +1711,7 @@ void *main_send_thread(void *arg)
                 if (wait_sec > MAIN_SEND_RETRY_WAIT_SEC)
                     wait_sec = MAIN_SEND_RETRY_WAIT_SEC;
 
-                main_wait_for_data_wakeup(&wakeup_seq_seen, wait_sec);
+                main_data_wakeup(&wakeup_seq_seen, wait_sec);
                 state = MAIN_ST_IDLE;
                 break;
             }
@@ -1696,7 +1728,7 @@ void *main_send_thread(void *arg)
             eg_ready_fail_count = 0;
             next_4g_try_time = 0;
 
-            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+            main_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
             usleep(1000 * 1000);
 
             state = MAIN_ST_IDLE;

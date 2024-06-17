@@ -153,8 +153,8 @@ int main(int argc, char *argv[])
         eg_monitor_thread,
         // watchdog_feed_thread,
         bt_comm_thread,
-        lora_receive_thread,
         serial_send_thread,
+        lora_receive_thread,
     };
     void *thread_args[THREAD_COUNT] = {
         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &my_lora_config};

@@ -17,6 +17,54 @@
 #define BUFFER_SIZE 1024
 #define LOG_COMPACT_MAX_LINE 1024
 #define LOG_COMPACT_MAX_KEEP_FRAMES 32
+static int hex_value(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    return -1;
+}
+
+int data_separator(const char *hex_str,
+                          unsigned char *out_bytes,
+                          int max_len)
+{
+    int byte_count = 0;
+    const char *p = hex_str;
+
+    if (!hex_str || !out_bytes || max_len <= 0)
+        return -1;
+
+    while (*p)
+    {
+        if (*p == ',')
+        {
+            if (byte_count >= max_len)
+                return -1;
+
+            out_bytes[byte_count++] = ',';
+            p++;
+            continue;
+        }
+
+        int hi = hex_value(p[0]);
+        int lo = hex_value(p[1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;
+
+        if (byte_count >= max_len)
+            return -1;
+
+        out_bytes[byte_count++] = (unsigned char)((hi << 4) | lo);
+        p += 2;
+    }
+
+    return byte_count;
+}
 typedef struct
 {
     uint32_t id;

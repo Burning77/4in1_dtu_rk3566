@@ -126,7 +126,6 @@ int eg_send_cmd(const char *cmd, const char *expected_resp, int timeout_sec)
 int eg_init(void)
 {
     printf("[EG] Starting initialization...\n");
-
     // 1. AT 同步
     if (eg_send_cmd("AT\r\n", "OK", 2) != 0)
         return -1;
@@ -142,7 +141,6 @@ int eg_init(void)
         printf("[EG] SIM card not ready\n");
         return -1;
     }
-
     // 3. 查询信号质量（仅打印，不强制要求）
     eg_send_cmd("AT+CSQ\r\n", NULL, 2);
 
