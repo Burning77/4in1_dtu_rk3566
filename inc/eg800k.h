@@ -1,5 +1,7 @@
 #ifndef __EG800K_H__
 #define __EG800K_H__
+#define SERVER_IP "115.120.239.161"
+#define SERVER_PORT 28041
 // 定义模块状态
 typedef enum
 {

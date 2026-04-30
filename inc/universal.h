@@ -14,16 +14,24 @@
 #define RS485_LOG_PATH "/home/cat/rs485_data.log"
 #define RS232_LOG_PATH "/home/cat/rs232_data.log"
 #define BD_LOG_PATH "/home/cat/bd_data.log"
+#define LORA_LOG_PATH "/home/cat/lora_data.log"
+#define LORA_CFG_PATH "/home/cat/lora_cfg.ini"
+#define LORA_CFG_TMP_PATH "/home/cat/lora_cfg.ini.tmp"
 #define RS485_DATA 0
 #define RS232_DATA 1
 #define BD_DATA 2
 #define BT_DATA 3
 #define EG_DATA 4
+#define LORA_DATA 5
 #define FIFO_SIZE (16 * 1024) // 必须是2的幂次方
 #define BD_MSG_LEN 229
 #define EG_MSG_LEN 229
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
-
+#define LORA_MESH_GATEWAY 0x01
+#define LORA_MESH_NODE 0x00
+#define LORA_MESH_ROOT 0xff
+#define LORA_MESH_NOTROOT 0x00
+#define DEBUG
 typedef struct
 {
     int type;                // RS485_DATA 或 RS232_DATA
@@ -72,4 +80,6 @@ int pack_data_from_files(const char **paths, off_t *offsets, int file_count,
                          int *out_hex_len, int *out_entry_count);
 int load_offsets(const char *path, off_t *offsets, int count);
 int save_offsets(const char *path, const off_t *offsets, int count);
+uint16_t crc16(const uint8_t *data, uint16_t len);
+int push_lora_to_fifo(frame_processor_ctx_t *ctx, const uint8_t *data, uint8_t len);
 #endif

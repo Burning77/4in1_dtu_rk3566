@@ -42,8 +42,8 @@ int uart_init(const char *dev, speed_t baud)
     options.c_oflag &= ~OPOST;
 
     // 阻塞模式：至少读一个字节才返回
-    options.c_cc[VMIN] = 1;
-    options.c_cc[VTIME] = 0;
+    options.c_cc[VMIN] = 0;
+    options.c_cc[VTIME] = 10;
 
     tcsetattr(fd, TCSANOW, &options);
 

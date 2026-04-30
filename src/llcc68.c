@@ -3,13 +3,34 @@
 #include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <gpiod.h>
+#include <pthread.h>
+#include "../inc/universal.h"
 
 #define FREQ_STEP 0.953674
+#define MAX_FRAME_SIZE 256
+#define DIO3_3_3V 0x07
+#define LORA_SPI_SPEED 1000000
+#ifdef DEBUG
+#define IRQ_TX_DONE 0x0001
+#define IRQ_RX_DONE 0x0002
+#define IRQ_PREAMBLE_DETECTED 0x0004
+#define IRQ_SYNCWORD_VALID 0x0008
+#define IRQ_HEADER_VALID 0x0010
+#define IRQ_HEADER_ERR 0x0020
+#define IRQ_CRC_ERR 0x0040
+#define IRQ_TIMEOUT 0x0200
+
+#define IRQ_RX_DEBUG_MASK (IRQ_RX_DONE | IRQ_PREAMBLE_DETECTED |   \
+						   IRQ_SYNCWORD_VALID | IRQ_HEADER_VALID | \
+						   IRQ_HEADER_ERR | IRQ_CRC_ERR | IRQ_TIMEOUT)
+#endif
 // 全局句柄
-static int spi_fd = -1;
+int spi_fd = -1;
 static struct gpiod_chip *gpio_chip = NULL;
 static struct gpiod_line *line_nss = NULL;
 static struct gpiod_line *line_reset = NULL;
@@ -17,27 +38,237 @@ static struct gpiod_line *line_busy = NULL;
 static struct gpiod_line *line_dio1 = NULL;
 static uint8_t regModeParam = 0x01; // 0: LDO, 1: DC-DC
 static loRa_Para_t *lora_para_pt;
+static uint8_t last_frame[MAX_FRAME_SIZE];
+static int last_len = 0;
+static uint8_t tx_buf[260];
+static uint8_t rx_buf[260];
+static pthread_mutex_t g_lora_lock = PTHREAD_MUTEX_INITIALIZER;
+extern pthread_mutex_t g_lora_cfg_mutex;
+extern loRa_Para_t my_lora_config;
+int CheckBusy(int timeout_ms);
+uint16_t GetIrqStatus(void);
+static void dump_lora_irq(uint16_t irq)
+{
+	printf("[LORA IRQ] irq=0x%04X", irq);
 
+	if (irq & IRQ_TX_DONE)
+		printf(" TX_DONE");
+	if (irq & IRQ_RX_DONE)
+		printf(" RX_DONE");
+	if (irq & IRQ_PREAMBLE_DETECTED)
+		printf(" PREAMBLE");
+	if (irq & IRQ_SYNCWORD_VALID)
+		printf(" SYNCWORD");
+	if (irq & IRQ_HEADER_VALID)
+		printf(" HEADER_VALID");
+	if (irq & IRQ_HEADER_ERR)
+		printf(" HEADER_ERR");
+	if (irq & IRQ_CRC_ERR)
+		printf(" CRC_ERR");
+	if (irq & IRQ_TIMEOUT)
+		printf(" TIMEOUT");
+
+	printf("\n");
+}
+uint8_t GetStatusRaw(void)
+{
+	uint8_t tx[2] = {0xC0, 0x00};
+	uint8_t rx[2] = {0};
+
+	spi_transfer(tx, rx, 2);
+
+	// printf("[LORA STATUS RAW] rx=%02X %02X\n", rx[0], rx[1]);
+
+	return rx[1];
+}
+static int lora_write_cmd(uint8_t opcode, const uint8_t *params, uint8_t len)
+{
+	uint8_t buf[16];
+
+	if (len + 1 > sizeof(buf))
+		return -1;
+
+	if (CheckBusy(100) != 0)
+		return -1;
+
+	buf[0] = opcode;
+
+	if (len > 0 && params != NULL)
+		memcpy(&buf[1], params, len);
+
+	spi_transfer(buf, NULL, len + 1);
+	return 0;
+}
+void SetDIO2AsRfSwitchCtrl(void)
+{
+	uint8_t enable = 0x01;
+	lora_write_cmd(0x9D, &enable, 1);
+}
+
+void SetDIO3AsTCXOCtrl(uint8_t tcxoVoltage)
+{
+	uint8_t params[4];
+
+	params[0] = tcxoVoltage; // 0x07 = 3.3V
+	params[1] = 0x00;
+	params[2] = 0x00;
+	params[3] = 0x64; // 官方例程用 0x000064
+
+	lora_write_cmd(0x97, params, 4);
+}
+void lora_cfg_get(loRa_Para_t *out)
+{
+	if (out == NULL)
+		return;
+
+	pthread_mutex_lock(&g_lora_cfg_mutex);
+	*out = my_lora_config;
+	pthread_mutex_unlock(&g_lora_cfg_mutex);
+}
+
+void lora_cfg_set(uint8_t field, uint8_t value)
+{
+	pthread_mutex_lock(&g_lora_cfg_mutex);
+
+	switch (field)
+	{
+	case 0: // is_root
+		my_lora_config.is_root = value;
+		break;
+	case 1: // mesh_type
+		my_lora_config.mesh_type = value;
+		break;
+	case 2: // net_id
+		my_lora_config.net_id = value;
+		break;
+	case 3: // dev_id
+		my_lora_config.dev_id = value;
+		break;
+	default:
+		break;
+	}
+
+	pthread_mutex_unlock(&g_lora_cfg_mutex);
+}
+int lora_cfg_save_persist(void)
+{
+	loRa_Para_t cfg;
+	int fd, dirfd;
+	char buf[128];
+	int len;
+
+	lora_cfg_get(&cfg);
+
+	fd = open(LORA_CFG_TMP_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0)
+	{
+		perror("open LORA_CFG_TMP_PATH");
+		return -1;
+	}
+
+	len = snprintf(buf, sizeof(buf),
+				   "is_root=0x%02X\n"
+				   "mesh_type=0x%02X\n"
+				   "net_id=0x%02X\n"
+				   "dev_id=0x%02X\n",
+				   cfg.is_root, cfg.mesh_type, cfg.net_id, cfg.dev_id);
+
+	if (write(fd, buf, len) != len)
+	{
+		perror("write lora cfg");
+		close(fd);
+		return -1;
+	}
+
+	if (fsync(fd) != 0)
+	{
+		perror("fsync lora cfg");
+		close(fd);
+		return -1;
+	}
+
+	close(fd);
+
+	if (rename(LORA_CFG_TMP_PATH, LORA_CFG_PATH) != 0)
+	{
+		perror("rename lora cfg");
+		return -1;
+	}
+
+	dirfd = open("/home/cat", O_RDONLY | O_DIRECTORY);
+	if (dirfd >= 0)
+	{
+		fsync(dirfd);
+		close(dirfd);
+	}
+
+	printf("[LORA CFG] saved: root=0x%02X mesh=0x%02X net=0x%02X dev=0x%02X\n",
+		   cfg.is_root, cfg.mesh_type, cfg.net_id, cfg.dev_id);
+	return 0;
+}
+int lora_cfg_load_persist(loRa_Para_t *cfg)
+{
+	FILE *fp;
+	char line[64];
+	unsigned int val;
+
+	if (cfg == NULL)
+		return -1;
+
+	fp = fopen(LORA_CFG_PATH, "r");
+	if (fp == NULL)
+	{
+		printf("[LORA CFG] no cfg file, using default config\n");
+		return 0;
+	}
+
+	while (fgets(line, sizeof(line), fp))
+	{
+		if (sscanf(line, "is_root=0x%x", &val) == 1)
+		{
+			if (val == LORA_MESH_ROOT || val == LORA_MESH_NOTROOT)
+				cfg->is_root = (uint8_t)val;
+		}
+		else if (sscanf(line, "mesh_type=0x%x", &val) == 1)
+		{
+			if (val == LORA_MESH_GATEWAY || val == LORA_MESH_NODE)
+				cfg->mesh_type = (uint8_t)val;
+		}
+		else if (sscanf(line, "net_id=0x%x", &val) == 1)
+		{
+			cfg->net_id = (uint8_t)val;
+		}
+		else if (sscanf(line, "dev_id=0x%x", &val) == 1)
+		{
+			cfg->dev_id = (uint8_t)val;
+		}
+	}
+
+	fclose(fp);
+
+	printf("[LORA CFG] loaded: root=0x%02X mesh=0x%02X net=0x%02X dev=0x%02X\n",
+		   cfg->is_root, cfg->mesh_type, cfg->net_id, cfg->dev_id);
+	return 0;
+}
 int hw_init(void)
 {
-	// 1. 初始化 SPI
 	spi_fd = open(SPI_DEV_PATH, O_RDWR);
 	if (spi_fd < 0)
 	{
 		perror("Failed to open SPI");
 		return -1;
 	}
-
-	// 配置 SPI 模式 0, 8位, 速度 (LLCC68 最高 16MHz，这里设 10MHz 安全)
 	uint8_t mode = SPI_MODE_0;
 	uint8_t bits = 8;
-	uint32_t speed = 10000000;
+	uint32_t speed = LORA_SPI_SPEED;
 
-	ioctl(spi_fd, SPI_IOC_WR_MODE, &mode);
-	ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
-	ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
+	if (ioctl(spi_fd, SPI_IOC_WR_MODE, &mode) < 0)
+		perror("SPI_IOC_WR_MODE");
+	if (ioctl(spi_fd, SPI_IOC_WR_BITS_PER_WORD, &bits) < 0)
+		perror("SPI_IOC_WR_BITS_PER_WORD");
+	if (ioctl(spi_fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed) < 0)
+		perror("SPI_IOC_WR_MAX_SPEED_HZ");
 
-	// 2. 初始化 GPIO
 	gpio_chip = gpiod_chip_open_by_name(GPIO_CHIP_NAME);
 	if (!gpio_chip)
 	{
@@ -46,37 +277,64 @@ int hw_init(void)
 		return -1;
 	}
 
-	// 获取 Lines
 	line_reset = gpiod_chip_get_line(gpio_chip, PIN_RESET);
 	line_busy = gpiod_chip_get_line(gpio_chip, PIN_BUSY);
 	line_dio1 = gpiod_chip_get_line(gpio_chip, PIN_DIO1);
 
-	// 配置方向
-	gpiod_line_request_output(line_reset, "llcc68", 1);
-	gpiod_line_request_input(line_busy, "llcc68");
-	gpiod_line_request_input(line_dio1, "llcc68");
+	if (!line_reset || !line_busy || !line_dio1)
+	{
+		perror("gpiod_chip_get_line lora");
+		gpiod_chip_close(gpio_chip);
+		close(spi_fd);
+		return -1;
+	}
+
+	if (gpiod_line_request_output(line_reset, "llcc68_reset", 1) < 0)
+	{
+		perror("gpiod_line_request_output reset");
+		return -1;
+	}
+
+	if (gpiod_line_request_input(line_busy, "llcc68_busy") < 0)
+	{
+		perror("gpiod_line_request_input busy");
+		return -1;
+	}
+
+	if (gpiod_line_request_input(line_dio1, "llcc68_dio1") < 0)
+	{
+		perror("gpiod_line_request_input dio1");
+		return -1;
+	}
+
+	// printf("[LORA GPIO] chip=%s reset=%d busy=%d dio1=%d\n",
+	// 	   GPIO_CHIP_NAME, PIN_RESET, PIN_BUSY, PIN_DIO1);
+
+	// printf("[LORA GPIO] initial busy=%d dio1=%d\n",
+	// 	   gpiod_line_get_value(line_busy),
+	// 	   gpiod_line_get_value(line_dio1));
 
 	return 0;
 }
-void spi_init()
-{
-	// 1. 打开SPI设备
-	int fd = open(SPI_DEV_PATH, O_RDWR);
-	if (fd < 0)
-	{
-		perror("无法打开SPI设备");
-		return 1;
-	}
+// void spi_init()
+// {
+// 	// 1. 打开SPI设备
+// 	int fd = open(SPI_DEV_PATH, O_RDWR);
+// 	if (fd < 0)
+// 	{
+// 		perror("无法打开SPI设备");
+// 		return 1;
+// 	}
 
-	// 2. 配置SPI参数
-	uint8_t mode = SPI_MODE_0; // CPOL=0, CPHA=0
-	uint8_t bits = 8;		   // 8位数据
-	uint32_t speed = 1000000;  // 1MHz（可根据需要调整）
+// 	// 2. 配置SPI参数
+// 	uint8_t mode = SPI_MODE_0; // CPOL=0, CPHA=0
+// 	uint8_t bits = 8;		   // 8位数据
+// 	uint32_t speed = 1000000;  // 1MHz（可根据需要调整）
 
-	ioctl(fd, SPI_IOC_WR_MODE, &mode);
-	ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
-	ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
-}
+// 	ioctl(fd, SPI_IOC_WR_MODE, &mode);
+// 	ioctl(fd, SPI_IOC_WR_BITS_PER_WORD, &bits);
+// 	ioctl(fd, SPI_IOC_WR_MAX_SPEED_HZ, &speed);
+// }
 void reset_llcc68()
 {
 	gpiod_line_set_value(line_reset, 0); // 拉低复位
@@ -92,158 +350,131 @@ void spi_transfer(uint8_t *tx_buf, uint8_t *rx_buf, uint32_t len)
 		.rx_buf = (unsigned long)rx_buf,
 		.len = len,
 		.delay_usecs = 0,
-		.speed_hz = 10000000,
+		.speed_hz = LORA_SPI_SPEED,
 		.bits_per_word = 8,
 	};
-	ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+
+	int ret = ioctl(spi_fd, SPI_IOC_MESSAGE(1), &tr);
+	if (ret < 1)
+	{
+		perror("[LORA SPI] SPI_IOC_MESSAGE");
+	}
 }
 void SetStandby(uint8_t StdbyConfig)
 {
-	uint8_t Opcode;
-
-	CheckBusy();
-	Opcode = SET_STANDBY; // 0x80
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&StdbyConfig, NULL, 1);
-}
-void CheckBusy(void)
-{
-	uint8_t busy_timeout_cnt;
-
-	busy_timeout_cnt = 0;
-	while (gpiod_line_get_value(line_busy)) // 忙信号为高电平
+	if (CheckBusy(100) != 0)
 	{
-		usleep(1 * 1000);
-		busy_timeout_cnt++;
+		return;
+	}
+	lora_write_cmd(SET_STANDBY, &StdbyConfig, 1);
+}
+int CheckBusy(int timeout_ms)
+{
+	int cnt = 0;
 
-		if (busy_timeout_cnt > 2) // TODO
+	while (gpiod_line_get_value(line_busy))
+	{
+		usleep(1000);
+		cnt++;
+
+		if (cnt >= timeout_ms)
 		{
-			SetStandby(0);	// 0:STDBY_RC; 1:STDBY_XOSC
-			reset_llcc68(); // reset RF
-			LLCC68_Config();
-			break;
+			printf("[LORA] BUSY timeout, busy still high\n");
+			return -1;
 		}
 	}
+
+	return 0;
 }
 void SetRegulatorMode(void)
 {
-	uint8_t Opcode;
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
 
-	CheckBusy();
-	Opcode = 0x96;
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&regModeParam, NULL, 1); // regModeParam
+	lora_write_cmd(0x96, &regModeParam, 1);
 }
 
 void SetPaConfig(void)
 {
-	uint8_t Opcode;
-	uint8_t paDutyCycle = 0x04; // paDutyCycle
-	uint8_t hpMax = 0x07;		// hpMax:0x00~0x07; 7:22dbm
-	uint8_t deviceSel = 0x00;	// deviceSel:0x00~0x01; 0:PA_BOOST; 1:RFO
-
-	CheckBusy();
-	Opcode = 0x95;
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&paDutyCycle, NULL, 1); // paDutyCycle
-	spi_transfer(&hpMax, NULL, 1);		 // hpMax:0x00~0x07; 7:22dbm
-	spi_transfer(&deviceSel, NULL, 1);	 // deviceSel
-	spi_transfer(&regModeParam, NULL, 1);
+	uint8_t tx_cmd[4];
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
+	tx_cmd[0] = 0x04;
+	tx_cmd[1] = 0x07;
+	tx_cmd[2] = 0x00;
+	tx_cmd[3] = regModeParam;
+	lora_write_cmd(0x95, tx_cmd, 4);
 }
 
 void SetPacketType(uint8_t PacketType)
 {
-	uint8_t Opcode;
-
-	CheckBusy();
-	Opcode = SET_PACKET_TYPE; // 0x8A
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&PacketType, NULL, 1);
+	lora_write_cmd(SET_PACKET_TYPE, &PacketType, 1);
 }
 void SetRfFrequency(uint32_t frequency)
 {
-	uint8_t Opcode;
-	uint8_t Rf_Freq[4];
-	uint32_t RfFreq = 0;
+	uint8_t params[4];
+	uint32_t rfFreq = (uint32_t)((double)frequency / (double)FREQ_STEP);
 
-	RfFreq = (uint32_t)((double)frequency / (double)FREQ_STEP);
+	params[0] = (rfFreq >> 24) & 0xFF;
+	params[1] = (rfFreq >> 16) & 0xFF;
+	params[2] = (rfFreq >> 8) & 0xFF;
+	params[3] = rfFreq & 0xFF;
 
-	CheckBusy();
-
-	Opcode = SET_RF_FREQUENCY; // 0x86
-
-	Rf_Freq[0] = (RfFreq >> 24) & 0xFF; // MSB
-	Rf_Freq[1] = (RfFreq >> 16) & 0xFF;
-	Rf_Freq[2] = (RfFreq >> 8) & 0xFF;
-	Rf_Freq[3] = RfFreq & 0xFF; // LSB
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&Rf_Freq, NULL, 4);
+	lora_write_cmd(SET_RF_FREQUENCY, params, 4);
 }
 void SetTxParams(int8_t power, uint8_t RampTime)
 {
-	uint8_t Opcode;
+	uint8_t params[2];
 
-	CheckBusy();
-	Opcode = SET_TX_PARAMS; // 0x8E
+	params[0] = (uint8_t)power;
+	params[1] = RampTime;
 
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&power, NULL, 1);
-	spi_transfer(&RampTime, NULL, 1);
+	lora_write_cmd(SET_TX_PARAMS, params, 2);
 }
 
 void SetModulationParams(uint8_t sf, uint8_t bw, uint8_t cr, uint8_t ldro)
 {
-	uint8_t Opcode;
-	uint8_t reserve_bytes = 0xFF;
-	CheckBusy();
-	Opcode = 0x8B;
-
-	spi_transfer(&Opcode, NULL, 1);
-
-	spi_transfer(&sf, NULL, 1);	  // SF=5~12
-	spi_transfer(&bw, NULL, 1);	  // BW
-	spi_transfer(&cr, NULL, 1);	  // CR
-	spi_transfer(&ldro, NULL, 1); // LDRO LowDataRateOptimize 0:OFF; 1:ON;
-
-	spi_transfer(&reserve_bytes, NULL, 1); //
-	spi_transfer(&reserve_bytes, NULL, 1); //
-	spi_transfer(&reserve_bytes, NULL, 1); //
-	spi_transfer(&reserve_bytes, NULL, 1); //
+	uint8_t params[8];
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
+	params[0] = sf;	  // SF=5~12
+	params[1] = bw;	  // BW
+	params[2] = cr;	  // CR
+	params[3] = ldro; // LDRO LowDataRateOptimize 0:OFF; 1:ON;
+	params[4] = 0xFF;
+	params[5] = 0xFF;
+	params[6] = 0xFF;
+	params[7] = 0xFF;
+	lora_write_cmd(0x8B, params, 8);
 }
 
 void SetPacketParams(uint8_t payload_len)
 {
 	uint8_t Opcode;
-	uint16_t prea_len;
-	uint8_t prea_len_h, prea_len_l;
-	uint8_t crc_type = 0x01; // CRCType 0:OFF 1:ON
-	uint8_t invertIQ = 0x00; // InvertIQ 0:Standard 1:Inverted
-	uint8_t reserve_bytes = 0xFF;
-	uint8_t header_type = 0x00; // HeaderType 0:Variable,explicit 1:Fixed,implicit
-	CheckBusy();
+	uint16_t prea_len = 8;
+	uint8_t params[9];
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
 
-	Opcode = 0x8C;
+	params[0] = prea_len >> 8;
+	params[1] = prea_len & 0xFF;
+	params[2] = 0x00;
+	params[3] = payload_len;
+	params[4] = 0x01;
+	params[5] = 0x00;
+	params[6] = 0xFF;
+	params[7] = 0xFF;
+	params[8] = 0xFF;
 
-	prea_len = 8;
-	prea_len_h = prea_len >> 8;
-	prea_len_l = prea_len & 0xFF;
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&prea_len_h, NULL, 1);	 // PreambleLength MSB
-	spi_transfer(&prea_len_l, NULL, 1);	 // PreambleLength LSB
-	spi_transfer(&header_type, NULL, 1); // HeaderType 0:Variable,explicit 1:Fixed,implicit
-	// spi_transfer(&0x01);
-	spi_transfer(&payload_len, NULL, 1);   // PayloadLength: 0x00 to 0xFF
-	spi_transfer(&crc_type, NULL, 1);	   // CRCType 0:OFF 1:ON
-	spi_transfer(&invertIQ, NULL, 1);	   // InvertIQ 0:Standard
-	spi_transfer(&reserve_bytes, NULL, 1); // reserve
-	spi_transfer(&reserve_bytes, NULL, 1); // reserve
-	spi_transfer(&reserve_bytes, NULL, 1); // reserve
+	lora_write_cmd(0x8C, params, 9);
 }
 void LLCC68_Config()
 {
@@ -264,7 +495,8 @@ void LLCC68_Config()
 	SetStandby(0); // 0:STDBY_RC; 1:STDBY_XOSC
 	SetRegulatorMode();
 	SetPaConfig();
-
+	// SetDIO3AsTCXOCtrl(DIO3_3_3V);
+	SetDIO2AsRfSwitchCtrl();
 	SetPacketType(1);					   // 0:GFSK; 1:LORA
 	SetRfFrequency(rf_freq_temp);		   // RF_Freq = freq_reg*32M/(2^25)
 	SetTxParams(power_temp, SET_RAMP_10U); // set power and ramp_time
@@ -276,202 +508,196 @@ void LLCC68_Config()
 
 void SetSleep(void)
 {
-	uint8_t Opcode, sleepConfig;
+	uint8_t sleepConfig;
 
-	CheckBusy();
-	Opcode = SET_SLEEP; // 0x84
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
 	sleepConfig = 0x00; // 0x04;	//bit2: 1:warm start; bit0:0: RTC timeout disable
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&sleepConfig, NULL, 1);
+	lora_write_cmd(SET_SLEEP, &sleepConfig, 1);
 }
 void SetBufferBaseAddress(uint8_t TX_base_addr, uint8_t RX_base_addr)
 {
-	uint8_t Opcode;
+	uint8_t params[2];
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
+	params[0] = TX_base_addr;
+	params[1] = RX_base_addr;
 
-	CheckBusy();
-	Opcode = SET_BUF_BASE_ADDR; // 0x8F
-
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&TX_base_addr, NULL, 1);
-	spi_transfer(&RX_base_addr, NULL, 1);
+	lora_write_cmd(SET_BUF_BASE_ADDR, params, 2);
 }
 void SetDioIrqParams(uint16_t irq)
 {
-	uint8_t Opcode;
-	uint16_t Irq_Mask;
-	uint8_t Irq_Mask_h, Irq_Mask_l;
-	uint16_t DIO1Mask;
-	uint8_t DIO1Mask_h, DIO1Mask_l;
-	uint16_t DIO2Mask;
-	uint8_t DIO2Mask_h, DIO2Mask_l;
-	uint16_t DIO3Mask;
-	uint8_t DIO3Mask_h, DIO3Mask_l;
 
-	Irq_Mask = irq;
-	DIO1Mask = irq;
-	DIO2Mask = 0;
-	DIO3Mask = 0;
+	uint8_t params[8];
+	params[0] = irq >> 8;
+	params[1] = irq & 0xFF;
+	params[2] = irq >> 8;
+	params[3] = irq & 0xFF;
+	params[4] = 0;
+	params[5] = 0;
+	params[6] = 0;
+	params[7] = 0;
 
-	Irq_Mask_h = Irq_Mask >> 8;
-	Irq_Mask_l = Irq_Mask & 0xFF;
-	DIO1Mask_h = DIO1Mask >> 8;
-	DIO1Mask_l = DIO1Mask & 0xFF;
-	DIO2Mask_h = DIO2Mask >> 8;
-	DIO2Mask_l = DIO2Mask & 0xFF;
-	DIO3Mask_h = DIO3Mask >> 8;
-	DIO3Mask_l = DIO3Mask & 0xFF;
-	Opcode = 0x08;
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
 
-	CheckBusy();
-
-	spi_transfer(&Opcode, NULL, 1);
-
-	spi_transfer(&Irq_Mask_h, NULL, 1); // Irq_Mask MSB
-	spi_transfer(&Irq_Mask_l, NULL, 1); // Irq_Mask LSB
-	spi_transfer(&DIO1Mask_h, NULL, 1); //
-	spi_transfer(&DIO1Mask_l, NULL, 1); //
-
-	spi_transfer(&DIO2Mask_h, NULL, 1); //
-	spi_transfer(&DIO2Mask_l, NULL, 1); //
-	spi_transfer(&DIO3Mask_h, NULL, 1); //
-	spi_transfer(&DIO3Mask_l, NULL, 1); //
+	lora_write_cmd(0x08, params, 8);
 }
 void SetRx(uint32_t timeout)
 {
-	uint8_t Opcode;
 	uint8_t time_out[3];
 
-	CheckBusy();
-
-	Opcode = SET_RX;					  // 0x82
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
 	time_out[0] = (timeout >> 16) & 0xFF; // MSB
 	time_out[1] = (timeout >> 8) & 0xFF;
 	time_out[2] = timeout & 0xFF; // LSB
 
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(&time_out[0], NULL, 1);
-	spi_transfer(&time_out[1], NULL, 1);
-	spi_transfer(&time_out[2], NULL, 1);
+	lora_write_cmd(SET_RX, time_out, 3);
 }
 void RxInit(void)
 {
-	SetBufferBaseAddress(0, 0); //(TX_base_addr,RX_base_addr)
-	// SetPacketParams(payload_length);//PreambleLength;HeaderType;PayloadLength;CRCType;InvertIQ
-	SetDioIrqParams(RxDone_IRQ); // RxDone IRQ
-
-	SetRx(0); // timeout = 0
+	SetStandby(0);
+	SetPacketParams(lora_para_pt->payload_size);
+	SetBufferBaseAddress(0, 0);
+	ClearIrqStatus(0xFFFF);
+	SetDioIrqParams(IRQ_RX_DEBUG_MASK);
+	SetRx(0xFFFFFF);
+	// printf("[LORA RX] RxInit done, DIO1=%d BUSY=%d IRQ=0x%04X\n",
+	// 	   gpiod_line_get_value(line_dio1),
+	// 	   gpiod_line_get_value(line_busy),
+	// 	   GetIrqStatus());
 }
 void SetTx(uint32_t timeout)
 {
-	uint8_t Opcode;
 	uint8_t time_out[3];
 
-	CheckBusy();
-	Opcode = SET_TX;					  // 0x83
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	} // 0x83
 	time_out[0] = (timeout >> 16) & 0xFF; // MSB
 	time_out[1] = (timeout >> 8) & 0xFF;
 	time_out[2] = timeout & 0xFF; // LSB
 
-	spi_transfer(&Opcode, NULL, 1);
-	spi_transfer(time_out, NULL, 3);
+	lora_write_cmd(SET_TX, time_out, 3);
 }
 bool Lora_init(loRa_Para_t *lp_pt)
 {
 	lora_para_pt = lp_pt;
-	hw_init();
-	spi_init();
+
+	if (hw_init() != 0)
+	{
+		printf("[LORA] hw_init failed\n");
+		return false;
+	}
+
 	reset_llcc68();
+	// printf("[LORA] status after reset=0x%02X\n", GetStatusRaw());
 	LLCC68_Config();
+	// printf("[LORA] status after config=0x%02X\n", GetStatusRaw());
+	RxInit();
+
 	return true;
 }
 uint16_t GetIrqStatus(void)
 {
-	uint8_t tx_buf[4];
-	uint8_t rx_buf[4];
+	uint8_t tx_buf[4] = {0x12, 0xFF, 0xFF, 0xFF};
+	uint8_t rx_buf[4] = {0};
 	uint16_t irq_status = 0;
 
-	CheckBusy();
-
-	tx_buf[0] = 0x12; // 命令码
-	tx_buf[1] = 0xff;
-	tx_buf[2] = 0xff;
-	tx_buf[3] = 0xff;
+	if (CheckBusy(100) != 0)
+	{
+		printf("[LORA] GetIrqStatus BUSY timeout\n");
+		return 0xFFFF;
+	}
 
 	spi_transfer(tx_buf, rx_buf, 4);
-	irq_status = (rx_buf[1] << 8) | rx_buf[2];
+
+	// printf("[LORA IRQ RAW] rx=%02X %02X %02X %02X\n",
+	// 	   rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+
+	/*
+	 * rx_buf[1] 是 Status
+	 * rx_buf[2] 是 IRQ MSB
+	 * rx_buf[3] 是 IRQ LSB
+	 */
+	irq_status = ((uint16_t)rx_buf[2] << 8) | rx_buf[3];
 
 	return irq_status;
 }
 void GetRxBufferStatus(uint8_t *payload_len, uint8_t *buf_pointer)
 {
-	uint8_t tx_buf[4]; // 发送缓冲区：1字节命令 + 3字节哑元数据
-	uint8_t rx_buf[4]; // 接收缓冲区
+	uint8_t tx_buf[4] = {0x13, 0xFF, 0xFF, 0xFF};
+	uint8_t rx_buf[4] = {0};
 
-	// 1. 检查设备是否繁忙
-	CheckBusy();
+	if (payload_len == NULL || buf_pointer == NULL)
+		return;
 
-	// 2. 构建发送数据
-	tx_buf[0] = 0x13; // GetRxBufferStatus 命令码
-	tx_buf[1] = 0xFF;
-	tx_buf[2] = 0xFF;
-	tx_buf[3] = 0xFF;
+	if (CheckBusy(100) != 0)
+	{
+		printf("[LORA] GetRxBufferStatus BUSY timeout\n");
+		*payload_len = 0;
+		*buf_pointer = 0;
+		return;
+	}
+
 	spi_transfer(tx_buf, rx_buf, 4);
-	// 字节0: 状态 (Status)
-	// 字节1: 有效负载长度 (payload_len)
-	// 字节2: 缓冲区指针 (buf_pointer)
-	// 字节3: 保留或未使用
-	// 原始函数中 Status 未被使用，因此这里忽略 rx_buf[0]
-	*payload_len = rx_buf[1];
-	*buf_pointer = rx_buf[2];
+
+	printf("[LORA RXBUF RAW] rx=%02X %02X %02X %02X\n",
+		   rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+
+	/*
+	 * rx_buf[1] 是 Status
+	 * rx_buf[2] 是 payload_len
+	 * rx_buf[3] 是 buf_pointer
+	 */
+	*payload_len = rx_buf[2];
+	*buf_pointer = rx_buf[3];
 }
 void ReadBuffer(uint8_t offset, uint8_t *data, uint8_t length)
 {
-	uint8_t *tx_buf; // 发送缓冲区指针
-	uint8_t *rx_buf; // 接收缓冲区指针
-	uint8_t i;
-	// 1. 检查参数有效性
-	if (length < 1)
-	{
+	if (data == NULL || length < 1)
 		return;
-	}
-	CheckBusy();
-	uint32_t total_len = 3 + length;
-	tx_buf = malloc(total_len);
-	rx_buf = malloc(total_len);
-	if (!tx_buf || !rx_buf)
+
+	if ((3 + length) > sizeof(tx_buf) || (3 + length) > sizeof(rx_buf))
+		return;
+
+	if (CheckBusy(100) != 0)
 	{
-		// 内存分配失败处理
-		if (tx_buf)
-			free(tx_buf);
-		if (rx_buf)
-			free(rx_buf);
 		return;
 	}
 
-	tx_buf[0] = 0x1E;	// ReadBuffer 命令码
-	tx_buf[1] = offset; // 偏移量
+	uint32_t total_len = 3 + length;
+
+	tx_buf[0] = 0x1E;
+	tx_buf[1] = offset;
 	tx_buf[2] = 0xFF;
-	for (i = 3; i < total_len; i++)
-	{
-		tx_buf[i] = 0xFF;
-	}
+	memset(&tx_buf[3], 0xFF, length);
+	memset(rx_buf, 0, total_len);
+
 	spi_transfer(tx_buf, rx_buf, total_len);
-	for (i = 0; i < length; i++)
-	{
-		data[i] = rx_buf[3 + i];
-	}
-	free(tx_buf);
-	free(rx_buf);
+
+	memcpy(data, &rx_buf[3], length);
 }
 void ClearIrqStatus(uint16_t irq)
 {
-	uint8_t tx_buf[3];
-	CheckBusy();
-	tx_buf[0] = 0x02;		  // ClearIrqStatus 命令码
-	tx_buf[1] = (irq >> 8);	  // 中断掩码高字节
-	tx_buf[2] = (irq & 0xFF); // 中断掩码低字节
-
-	spi_transfer(tx_buf, NULL, 3);
+	uint8_t params[2];
+	if (CheckBusy(100) != 0)
+	{
+		return;
+	}
+	params[0] = (irq >> 8);	  // 中断掩码高字节
+	params[1] = (irq & 0xFF); // 中断掩码低字节
+	lora_write_cmd(0x02, params, 2);
 }
 uint8_t WaitForIRQ_RxDone(void)
 {
@@ -485,7 +711,13 @@ uint8_t WaitForIRQ_RxDone(void)
 		if ((Irq_Status & 0x02) == RxDone_IRQ)
 		{
 			GetRxBufferStatus(&packet_size, &buf_offset);
-			ReadBuffer(buf_offset, rxbuf_pt, packet_size + 1);
+			if (packet_size == 0 || packet_size > lora_para_pt->payload_size)
+			{
+				ClearIrqStatus(RxDone_IRQ);
+				RxInit();
+				return 0;
+			}
+			ReadBuffer(buf_offset, rxbuf_pt, packet_size);
 			*rxcnt_pt = packet_size;
 			ClearIrqStatus(RxDone_IRQ); // Clear the IRQ RxDone flag
 			RxInit();
@@ -497,66 +729,129 @@ uint8_t WaitForIRQ_RxDone(void)
 
 uint8_t WaitForIRQ_TxDone(void)
 {
-	uint8_t time_out;
+	int timeout_ms = 3000;
 
-	time_out = 0;
-	while (!gpiod_line_get_value(line_dio1))
+	while (timeout_ms-- > 0)
 	{
-		time_out++;
-		usleep(10 * 1000);		// 10 ms
-		if (time_out > 200) // if timeout , reset the the chip
+		if (gpiod_line_get_value(line_dio1))
 		{
-			ClearIrqStatus(TxDone_IRQ); // Clear the IRQ TxDone flag
-			SetStandby(0);				// 0:STDBY_RC; 1:STDBY_XOSC
-			reset_llcc68();				// reset RF
-			LLCC68_Config();
-			printf("WaitFor IRQ_TxDone time out\n");
-			return 0;
+			uint16_t irq = GetIrqStatus();
+
+			if (irq & TxDone_IRQ)
+			{
+				ClearIrqStatus(TxDone_IRQ);
+				return 1;
+			}
+
+			if (irq != 0)
+				ClearIrqStatus(irq);
 		}
+
+		usleep(1000);
 	}
 
-	// Irq_Status = GetIrqStatus();
-	ClearIrqStatus(TxDone_IRQ); // Clear the IRQ TxDone flag
-	return 1;
+	printf("[LORA] TxDone timeout, DIO1=%d IRQ=0x%04X\n",
+		   gpiod_line_get_value(line_dio1),
+		   GetIrqStatus());
+
+	ClearIrqStatus(0xFFFF);
+	return 0;
 }
 void WriteBuffer(uint8_t offset, uint8_t *data, uint8_t length)
 {
-	uint8_t tx_buf[2];
+	uint8_t buf[260];
 
-	if (length < 1)
+	if (data == NULL || length < 1)
 		return;
 
-	CheckBusy();
-	tx_buf[0] = 0x0E;
-	tx_buf[1] = offset;
-	spi_transfer(tx_buf, NULL, 2);
-	spi_transfer(data, NULL, length);
+	if ((2 + length) > sizeof(buf))
+		return;
+
+	if (CheckBusy(100) != 0)
+		return;
+
+	buf[0] = 0x0E;
+	buf[1] = offset;
+	memcpy(&buf[2], data, length);
+
+	spi_transfer(buf, NULL, 2 + length);
 }
-void Lora_send(uint8_t *payload, uint8_t size)
+int Lora_send(uint8_t *payload, uint8_t size)
 {
-	SetStandby(0);				// 0:STDBY_RC; 1:STDBY_Xosc
-	SetBufferBaseAddress(0, 0); //(TX_base_addr,RX_base_addr)
+	int ok;
 
-	WriteBuffer(0, payload, size); //(offset,*data,length)
-	SetPacketParams(size);		   // PreambleLength;HeaderType;PayloadLength;CRCType;InvertIQ
+	if (payload == NULL || size == 0)
+		return -1;
 
-	SetDioIrqParams(TxDone_IRQ); // TxDone IRQ
+	pthread_mutex_lock(&g_lora_lock);
 
-	SetTx(0); // timeout = 0
+	SetStandby(0);
+	SetBufferBaseAddress(0, 0);
+	WriteBuffer(0, payload, size);
+	SetPacketParams(size);
+	ClearIrqStatus(0xFFFF);
+	SetDioIrqParams(TxDone_IRQ);
+	SetTx(0);
 
-	// Wait for the IRQ TxDone or Timeout (implement in another function)
-	printf("Sending data: %s\n", payload);
-	// 7. 等待发送完成中断
-	if (WaitForIRQ_TxDone())
+	ok = WaitForIRQ_TxDone();
+
+	if (ok)
 	{
 		printf("Data sent successfully.\n");
+		RxInit();
+		pthread_mutex_unlock(&g_lora_lock);
+		return 0;
 	}
-	else
-	{
-		printf("Data send failed or timeout.\n");
-	}
-}
 
+	printf("Data send failed or timeout.\n");
+	RxInit();
+	pthread_mutex_unlock(&g_lora_lock);
+	return -1;
+}
+int lora_unpack(uint8_t *buf, int len,
+				uint8_t expect_netid,
+				uint8_t expect_devid,
+				uint8_t *out_payload,
+				int *out_len)
+{
+	if (len < 4)
+		return -1; // 至少 NETID+DEVID+CRC
+
+	// 1. CRC校验
+	uint16_t recv_crc = buf[len - 2] | (buf[len - 1] << 8);
+	uint16_t calc_crc = crc16(buf, len - 2);
+
+	if (recv_crc != calc_crc)
+	{
+		printf("[LORA] CRC error\n");
+		return -2;
+	}
+
+	// 2. NETID / DEVID 校验
+	if (buf[0] != expect_netid || buf[1] != expect_devid)
+	{
+		printf("[LORA] ID mismatch\n");
+		return -3;
+	}
+
+	// 3. 去重（完全一样才丢）
+	if (len == last_len && memcmp(buf, last_frame, len) == 0)
+	{
+		printf("[LORA] Duplicate packet dropped\n");
+		return -4;
+	}
+
+	// 保存为最新帧
+	memcpy(last_frame, buf, len);
+	last_len = len;
+
+	// 4. 提取payload
+	int payload_len = len - 4;
+	memcpy(out_payload, &buf[2], payload_len);
+	*out_len = payload_len;
+
+	return 0;
+}
 void Lora_receive(uint8_t *payload, uint8_t size)
 {
 	rxbuf_pt = payload;
@@ -565,13 +860,108 @@ void Lora_receive(uint8_t *payload, uint8_t size)
 	SetDioIrqParams(RxDone_IRQ);
 	SetRx(0);
 	if (WaitForIRQ_RxDone())
-	{ // 此函数内部检查DIO1，并处理接收数据
-		printf("Received %u bytes: ", size);
-		for (int i = 0; i < size; i++)
+	{
+		uint8_t payload[256];
+		int payload_len;
+
+		int ret = lora_unpack(rxbuf_pt, *rxcnt_pt,
+							  0x01, 0x02, // 你的NETID/DEVID
+							  payload, &payload_len);
+
+		if (ret == 0)
 		{
-			printf("%c", payload[i]);
+			printf("[LORA] Valid packet (%d bytes): ", payload_len);
+			for (int i = 0; i < payload_len; i++)
+				printf("%02X ", payload[i]);
+			printf("\n");
 		}
-		printf("\n");
-		// 接收成功后，驱动内的 `WaitForIRQ_RxDone` 会重新调用 RxInit() 准备下一次接收
 	}
+}
+int lora_pack(uint8_t netid, uint8_t devid,
+			  uint8_t *payload, uint8_t payload_len,
+			  uint8_t *out_buf)
+{
+	int len = 0;
+
+	out_buf[len++] = netid;
+	out_buf[len++] = devid;
+
+	memcpy(&out_buf[len], payload, payload_len);
+	len += payload_len;
+
+	uint16_t crc = crc16(out_buf, len);
+
+	out_buf[len++] = crc & 0xFF;		// 低字节
+	out_buf[len++] = (crc >> 8) & 0xFF; // 高字节
+
+	return len;
+}
+int Lora_send_packet(uint8_t netid, uint8_t devid,
+					 uint8_t *payload, uint8_t size)
+{
+	uint8_t buf[256];
+	int len;
+
+	if (payload == NULL || size == 0)
+		return -1;
+
+	len = lora_pack(netid, devid, payload, size, buf);
+	return Lora_send(buf, len);
+}
+
+int Lora_recv_packet(uint8_t *payload, uint8_t *out_len)
+{
+	uint16_t irq_status;
+	uint8_t packet_size = 0;
+	uint8_t buf_offset = 0;
+	static time_t last_print = 0;
+	time_t now = time(NULL);
+
+	if (now != last_print)
+	{
+		printf("[LORA GPIO] DIO1=%d BUSY=%d IRQ=0x%04X\n",
+			   gpiod_line_get_value(line_dio1),
+			   gpiod_line_get_value(line_busy),
+			   GetIrqStatus());
+		last_print = now;
+	}
+	if (payload == NULL || out_len == NULL)
+		return -1;
+
+	pthread_mutex_lock(&g_lora_lock);
+
+	// 没有中断，表示暂时没有收到数据
+	if (!gpiod_line_get_value(line_dio1))
+	{
+		pthread_mutex_unlock(&g_lora_lock);
+		return 0;
+	}
+
+	irq_status = GetIrqStatus();
+	dump_lora_irq(irq_status);
+	if ((irq_status & RxDone_IRQ) != RxDone_IRQ)
+	{
+		ClearIrqStatus(irq_status);
+		pthread_mutex_unlock(&g_lora_lock);
+		return 0;
+	}
+
+	GetRxBufferStatus(&packet_size, &buf_offset);
+
+	if (packet_size == 0 || packet_size > lora_para_pt->payload_size)
+	{
+		ClearIrqStatus(RxDone_IRQ);
+		RxInit();
+		pthread_mutex_unlock(&g_lora_lock);
+		return -2;
+	}
+
+	ReadBuffer(buf_offset, payload, packet_size);
+	*out_len = packet_size;
+
+	ClearIrqStatus(RxDone_IRQ);
+	RxInit(); // 收完立刻回到接收态
+
+	pthread_mutex_unlock(&g_lora_lock);
+	return 1;
 }

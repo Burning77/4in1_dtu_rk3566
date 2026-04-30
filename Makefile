@@ -11,7 +11,7 @@ CFLAGS = -Wall -Wextra -O2 -I inc
 LDLIBS = -lgpiod -lpthread
 
 # 源文件（带路径）
-SRCS = src/main.c src/gpio.c src/usart.c src/rtc.c com/kfifo.c com/universal.c src/llcc68.c app/lora_protocol.c app/thread_summary.c src/eg800k.c src/watch_dog.c
+SRCS = src/main.c src/gpio.c src/usart.c src/power.c com/kfifo.c com/universal.c src/llcc68.c app/thread_summary.c src/eg800k.c src/watch_dog.c src/bluetooth.c
 
 # 目标文件（同样带路径）
 OBJS = $(SRCS:.c=.o)

@@ -10,6 +10,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <sys/time.h>
+#include <string.h>
 #define FRAME_TIMEOUT_MS 10
 #define BUFFER_SIZE 1024
 
@@ -19,6 +21,23 @@ extern struct gpiod_line *line_bt_pow;
 extern struct gpiod_line *line_4g_pow;
 extern struct gpiod_line *line_4g_boot;
 extern int eg_fd;
+uint16_t crc16(const uint8_t *data, uint16_t len)
+{
+    uint16_t crc = 0xFFFF;
+
+    for (int i = 0; i < len; i++)
+    {
+        crc ^= data[i];
+        for (int j = 0; j < 8; j++)
+        {
+            if (crc & 1)
+                crc = (crc >> 1) ^ 0xA001;
+            else
+                crc >>= 1;
+        }
+    }
+    return crc;
+}
 int hex_to_bytes(const char *hex_str, unsigned char *out_bytes, int max_len)
 {
     if (!hex_str || !out_bytes || max_len <= 0)
@@ -172,16 +191,16 @@ static void submit_frame(serial_state_t *state, frame_processor_ctx_t *ctx, cons
     pthread_mutex_unlock(ctx->fifo_lock);
 
     // 打印调试信息
-    printf("[%s COMPLETE %d bytes (%s)]: ", state->tag, state->frame_len, reason);
-    for (int i = 0; i < state->frame_len && i < 32; i++)
-    { // 限制打印长度
-        printf("%02X ", state->frame_buf[i]);
-    }
-    if (state->frame_len > 32)
-    {
-        printf("... (+%d more bytes)", state->frame_len - 32);
-    }
-    printf("\n");
+    // printf("[%s COMPLETE %d bytes (%s)]: ", state->tag, state->frame_len, reason);
+    // for (int i = 0; i < state->frame_len && i < 32; i++)
+    // { // 限制打印长度
+    //     printf("%02X ", state->frame_buf[i]);
+    // }
+    // if (state->frame_len > 32)
+    // {
+    //     printf("... (+%d more bytes)", state->frame_len - 32);
+    // }
+    // printf("\n");
 }
 
 // 初始化串口状态
@@ -199,8 +218,7 @@ void serial_state_init(serial_state_t *state, int data_type, const char *tag)
     state->data_type = data_type;
     state->tag = tag;
 }
-#include <sys/time.h>
-#include <string.h>
+
 
 void process_serial_data(serial_state_t *state, unsigned char *read_buf, int read_len, int is_timeout_triggered, frame_processor_ctx_t *ctx)
 {
@@ -264,7 +282,43 @@ void process_serial_data(serial_state_t *state, unsigned char *read_buf, int rea
         }
     }
 }
+int push_lora_to_fifo(frame_processor_ctx_t *ctx, const uint8_t *data, uint8_t len)
+{
+    fifo_message_t msg;
 
+    if (ctx == NULL || ctx->fifo == NULL ||
+        ctx->fifo_lock == NULL || ctx->fifo_not_empty == NULL ||
+        data == NULL || len == 0)
+    {
+        return -1;
+    }
+
+    if (len > sizeof(msg.data))
+    {
+        printf("[LORA RX] invalid len=%u, max=%zu\n", len, sizeof(msg.data));
+        return -1;
+    }
+
+    memset(&msg, 0, sizeof(msg));
+    msg.type = LORA_DATA;
+    msg.len = len;
+    memcpy(msg.data, data, len);
+
+    pthread_mutex_lock(ctx->fifo_lock);
+
+    if (kfifo_left(ctx->fifo) < sizeof(fifo_message_t))
+    {
+        pthread_mutex_unlock(ctx->fifo_lock);
+        printf("[LORA RX] fifo full, drop %u bytes\n", len);
+        return -1;
+    }
+
+    kfifo_put(ctx->fifo, (unsigned char *)&msg, sizeof(fifo_message_t));
+    pthread_cond_signal(ctx->fifo_not_empty);
+    pthread_mutex_unlock(ctx->fifo_lock);
+
+    return 0;
+}
 // // 处理串口数据
 // void process_serial_data(serial_state_t *state,
 //                          unsigned char *read_buf, int read_len,

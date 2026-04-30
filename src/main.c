@@ -1,12 +1,14 @@
 #include "../app/thread_summary.h"
 #include "../inc/watch_dog.h"
+#include "../inc/bluetooth.h"
 #include <stdatomic.h>
-#define THREAD_COUNT 8
+#define THREAD_COUNT 10
 typedef void *(*thread_func_t)(void *);
-atomic_int stop_flag = 0;
+volatile sig_atomic_t stop_flag = 0;
 struct kfifo data_fifo;
 static unsigned char fifo_buffer[FIFO_SIZE];
-// volatile sig_atomic_t stop_flag = 0;
+// RTC 唤醒间隔（秒）
+static int rtc_wakeup_interval = 10;
 int rtc_fd;
 extern int rs485_fd;
 extern int rs232_fd;
@@ -14,6 +16,19 @@ extern int bd_fd;
 extern int bt_fd;
 extern int eg_fd;
 extern int watchdog_fd;
+extern int spi_fd;
+loRa_Para_t my_lora_config = {
+    .is_root = LORA_MESH_ROOT,      // 是根节点;非根节点 0x00
+    .mesh_type = LORA_MESH_GATEWAY, // 网关；节点：0x00
+    .net_id = 0x01,
+    .dev_id = 0x0a,
+    .rf_freq = 433000000, // 中心频率：433 MHz
+    .tx_power = 14,       // 发射功率：14 dBm
+    .lora_sf = 7,         // 扩频因子：SF7 (需与 llcc68.h 中定义匹配，如 LORA_SF7)
+    .band_width = 0x04,   // 带宽：125 kHz (对应 LORA_BW_125，值0x04)
+    .code_rate = 0x01,    // 编码率：4/5 (对应 LORA_CR_4_5，值0x01)
+    .payload_size = 64    // 预期接收负载的最大长度
+};
 // int check_hardware_flow_control(int fd)
 // {
 //     struct termios options;
@@ -95,22 +110,30 @@ int main(int argc, char *argv[])
     // printf("Received %s bytes\n", buf);
     struct rtc_time set_time = {
         .tm_year = 2026 - 1900,
-        .tm_mon = 3 - 1, // 3月
-        .tm_mday = 31,
-        .tm_hour = 12,
+        .tm_mon = 4 - 1, // 4月
+        .tm_mday = 22,
+        .tm_hour = 17,
         .tm_min = 0,
         .tm_sec = 0,
         .tm_isdst = 0};
-    rtc_set_time(&set_time);
+
+    // 初始化 RX8010SJ RTC (通过 I2C)
+    // printf("Initializing RX8010SJ RTC...\n");
+    // if (rx8010_init() == 0)
+    // {
+    //     rx8010_set_time(&set_time);
+    //     printf("RX8010SJ RTC initialized successfully.\n");
+    // }
+    // else
+    // {
+    //     printf("Warning: RX8010SJ RTC init failed, using system RTC\n");
+    //     rtc_set_time(&set_time);
+    // }
+
+    // 保留 /dev/rtc0 用于兼容
     rtc_fd = open("/dev/rtc0", O_RDONLY);
-    loRa_Para_t my_lora_config = {
-        .rf_freq = 433000000, // 中心频率：433 MHz
-        .tx_power = 14,       // 发射功率：14 dBm
-        .lora_sf = 7,         // 扩频因子：SF7 (需与 llcc68.h 中定义匹配，如 LORA_SF7)
-        .band_width = 0x04,   // 带宽：125 kHz (对应 LORA_BW_125，值0x04)
-        .code_rate = 0x01,    // 编码率：4/5 (对应 LORA_CR_4_5，值0x01)
-        .payload_size = 64    // 预期接收负载的最大长度
-    };
+    printf("Loading LoRa config from file...\n");
+    lora_cfg_load_persist(&my_lora_config);
     printf("Initializing LoRa module...\n");
     if (!Lora_init(&my_lora_config))
     { // 将配置参数传递给驱动
@@ -128,13 +151,18 @@ int main(int argc, char *argv[])
         main_send_thread,
         lora_transform_thread,
         eg_monitor_thread,
-        watchdog_feed_thread};
+        watchdog_feed_thread,
+        bt_comm_thread,
+        lora_receive_thread,
+    };
+    void *thread_args[THREAD_COUNT] = {
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &my_lora_config};
     pthread_t tids[THREAD_COUNT];
     int created_count = 0;
     int ret = 1; // 默认失败
     for (int i = 0; i < THREAD_COUNT; i++)
     {
-        if (pthread_create(&tids[i], NULL, thread_funcs[i], NULL) != 0)
+        if (pthread_create(&tids[i], NULL, thread_funcs[i], thread_args[i]) != 0)
         {
             perror("pthread_create failed");
             atomic_store(&stop_flag, 1);
@@ -152,9 +180,24 @@ cleanup:
     // 如果是异常退出，等待已创建的线程
     if (ret != 0)
     {
+        const char *thread_names[THREAD_COUNT] = {
+            "receive_thread",
+            "serial_send_thread",
+            "read_rtc_thread",
+            "write_file_thread",
+            "main_send_thread",
+            "lora_transform_thread",
+            "eg_monitor_thread",
+            "watchdog_feed_thread",
+            "bt_comm_thread",
+            "lora_receive_thread",
+        };
+
         for (int i = 0; i < created_count; i++)
         {
+            printf("[MAIN] joining %s...\n", thread_names[i]);
             pthread_join(tids[i], NULL);
+            printf("[MAIN] joined %s\n", thread_names[i]);
         }
     }
     rf_power_off();
@@ -162,8 +205,10 @@ cleanup:
     uart_close(rs485_fd);
     uart_close(bd_fd);
     uart_close(eg_fd);
+    uart_close(bt_fd);
     gpio_cleanup();
     close(rtc_fd);
+    close(spi_fd);
     cleanup_watchdog();
     return ret;
 }

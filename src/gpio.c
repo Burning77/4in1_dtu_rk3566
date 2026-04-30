@@ -28,8 +28,8 @@ struct gpiod_chip *chip_rs485 = NULL;
 struct gpiod_line *line_rs485 = NULL;
 struct gpiod_chip *chip_bd_en = NULL;
 struct gpiod_line *line_bd_en = NULL;
-// struct gpiod_chip *chip_bd_pow = NULL;
-// struct gpiod_line *line_bd_pow = NULL;
+struct gpiod_chip *chip_bd_pow = NULL;
+struct gpiod_line *line_bd_pow = NULL;
 struct gpiod_chip *chip_bt_pow = NULL;
 struct gpiod_line *line_bt_pow = NULL;
 struct gpiod_chip *chip_4g_pow = NULL;
@@ -90,15 +90,30 @@ int gpio_init()
         return -1;
     }
 
-    // chip_bd_pow = gpiod_chip_open(BD_POW_CHIP);
-    // line_bd_pow = gpiod_chip_get_line(chip_bd_pow, BD_POW_LINE);
-    // // 请求为输出，初始值为0
-    // if (gpiod_line_request_output(line_bd_pow, "bd_pow_en", 0) < 0)
-    // {
-    //     perror("gpiod_line_request_output bd_pow_en");
-    //     gpiod_chip_close(chip_bd_pow);
-    //     return -1;
-    // }
+    // 北斗电源控制（可选，如果被占用则跳过）
+    chip_bd_pow = gpiod_chip_open(BD_POW_CHIP);
+    if (chip_bd_pow)
+    {
+        line_bd_pow = gpiod_chip_get_line(chip_bd_pow, BD_POW_LINE);
+        if (line_bd_pow)
+        {
+            // 请求为输出，初始值为0（关闭状态，按需开启）
+            if (gpiod_line_request_output(line_bd_pow, "bd_pow_en", 0) < 0)
+            {
+                // 如果被占用，打印警告但继续运行
+                perror("gpiod_line_request_output bd_pow_en (optional, continuing)");
+                line_bd_pow = NULL;
+                gpiod_chip_close(chip_bd_pow);
+                chip_bd_pow = NULL;
+            }
+        }
+        else
+        {
+            gpiod_chip_close(chip_bd_pow);
+            chip_bd_pow = NULL;
+        }
+    }
+    // 北斗电源控制是可选的，即使失败也继续运行
 
     chip_bt_pow = gpiod_chip_open(BT_POW_CHIP);
     line_bt_pow = gpiod_chip_get_line(chip_bt_pow, BT_POW_LINE);

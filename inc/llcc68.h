@@ -42,18 +42,29 @@ uint16_t *rxcnt_pt;
 // -----------------------------------
 typedef struct
 {
+	uint8_t is_root;
+	uint8_t mesh_type;
+	uint8_t net_id;
+	uint8_t dev_id;
 	uint32_t rf_freq;
 	int8_t tx_power;
 	uint8_t lora_sf;
 	uint8_t band_width;
 	uint8_t code_rate;
 	uint8_t payload_size;
-
 } loRa_Para_t;
+
 bool Lora_init();
 
 // 底层 SPI 传输
 void spi_transfer(uint8_t *tx_buf, uint8_t *rx_buf, uint32_t len);
-void Lora_send(uint8_t *payload, uint8_t size);
+int Lora_send(uint8_t *payload, uint8_t size);
 void Lora_receive(uint8_t *payload, uint8_t size);
+int Lora_send_packet(uint8_t netid, uint8_t devid,
+					 uint8_t *payload, uint8_t size);
+int Lora_recv_packet(uint8_t *payload, uint8_t *out_len);
+void lora_cfg_get(loRa_Para_t *out);
+void lora_cfg_set(uint8_t field, uint8_t value);
+int lora_cfg_save_persist(void);
+int lora_cfg_load_persist(loRa_Para_t *cfg);
 #endif // LLCC68_PORT_H
