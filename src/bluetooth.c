@@ -22,7 +22,7 @@
 extern int bt_fd;
 extern volatile sig_atomic_t stop_flag;
 extern struct gpiod_line *line_bt_status;
-
+extern int server_port;
 // ============== 全局变量 ==============
 static send_path_t g_send_path = SEND_PATH_AUTO; // 默认自动选择
 static pthread_mutex_t g_path_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -41,7 +41,7 @@ static int bt_send_lora_cfg(void)
     lora_cfg_get(&cfg);
 
     snprintf(msg, sizeof(msg),
-             "LL_LORA_ROOT_0x%02X,MESH_0x%02X,NET_0x%02X,DEV_0x%02X\r\n",
+             "BL_LORA_ROOT_0x%02X,MESH_0x%02X,NET_0x%02X,DEV_0x%02X\r\n",
              cfg.is_root, cfg.mesh_type, cfg.net_id, cfg.dev_id);
 
     return bt_send_text(msg);
@@ -56,7 +56,7 @@ static int bt_set_name(void)
 
     lora_cfg_get(&cfg);
 
-    snprintf(name, sizeof(name), "LLXT_%02X", cfg.dev_id);
+    snprintf(name, sizeof(name), "BL_%02X", cfg.dev_id);
     snprintf(cmd, sizeof(cmd), "AT+NAME=%s\r\n", name);
 
     tcflush(bt_fd, TCIFLUSH);
@@ -231,7 +231,7 @@ int bt_send_text(const char *text)
 int bt_send_heartbeat_simple(uint8_t hb)
 {
     char msg[32];
-    snprintf(msg, sizeof(msg), "LL_HB_%02X\r\n", hb);
+    snprintf(msg, sizeof(msg), "BL_HB_%02X\r\n", hb);
     return bt_send_text(msg);
 }
 int bt_send_status(const dtu_status_t *status)
@@ -385,9 +385,9 @@ static int bt_send_4g_status_simple(void)
     pthread_mutex_unlock(&g_status_mutex);
 
     if (status.eg_connected)
-        return bt_send_text("LL_4G_0x01\r\n");
+        return bt_send_text("BL_4G_0x01\r\n");
     else
-        return bt_send_text("LL_4G_0x00\r\n");
+        return bt_send_text("BL_4G_0x00\r\n");
 }
 /**
  * @brief 更新DTU状态（供其他模块调用）
@@ -416,88 +416,100 @@ void bt_handle_simple_command(const char *cmd)
 
     printf("[BT] Received cmd: %s\n", cmd);
 
-    if (strcmp(cmd, "LL_00") == 0)
+    if (strcmp(cmd, "BL_00") == 0)
     {
         bt_set_send_path(SEND_PATH_AUTO);
-        bt_send_text("LL_ACK_00\r\n");
+        bt_send_text("BL_ACK_00\r\n");
     }
-    else if (strcmp(cmd, "LL_01") == 0)
+    else if (strcmp(cmd, "BL_01") == 0)
     {
         bt_set_send_path(SEND_PATH_4G_ONLY);
-        bt_send_text("LL_ACK_01\r\n");
+        bt_send_text("BL_ACK_01\r\n");
     }
-    else if (strcmp(cmd, "LL_02") == 0)
+    else if (strcmp(cmd, "BL_02") == 0)
     {
         bt_set_send_path(SEND_PATH_BD_ONLY);
-        bt_send_text("LL_ACK_02\r\n");
+        bt_send_text("BL_ACK_02\r\n");
     }
-    else if (strcmp(cmd, "LL_03") == 0)
+    else if (strcmp(cmd, "BL_03") == 0)
     {
         bt_set_send_path(SEND_PATH_4G_FIRST);
-        bt_send_text("LL_ACK_03\r\n");
+        bt_send_text("BL_ACK_03\r\n");
     }
-    else if (strcmp(cmd, "LL_04") == 0)
+    else if (strcmp(cmd, "BL_04") == 0)
     {
         bt_set_send_path(SEND_PATH_BD_FIRST);
-        bt_send_text("LL_ACK_04\r\n");
+        bt_send_text("BL_ACK_04\r\n");
     }
     // 获取4g连接状态
-    else if (strcmp(cmd, "LL_0a") == 0 || strcmp(cmd, "LL_0A") == 0)
+    else if (strcmp(cmd, "BL_0a") == 0 || strcmp(cmd, "BL_0A") == 0)
     {
         bt_send_4g_status_simple();
     }
-    else if (strcmp(cmd, "LL_LORA_GET") == 0)
+    else if (strcmp(cmd, "BL_LORA_GET") == 0)
     {
         bt_send_lora_cfg();
     }
-    else if (sscanf(cmd, "LL_ROOT_%x", &val) == 1)
+    else if (sscanf(cmd, "BL_ROOT_%x", &val) == 1)
     {
         if (val == LORA_MESH_ROOT || val == LORA_MESH_NOTROOT)
         {
             lora_cfg_set(0, (uint8_t)val);
             if (lora_cfg_save_persist() == 0)
-                bt_send_text("LL_ACK_ROOT\r\n");
+                bt_send_text("BL_ACK_ROOT\r\n");
             else
-                bt_send_text("LL_ACK_SAVE_ERR\r\n");
+                bt_send_text("BL_ACK_SAVE_ERR\r\n");
         }
         else
         {
-            bt_send_text("LL_ACK_ERR\r\n");
+            bt_send_text("BL_ACK_ERR\r\n");
         }
     }
-    else if (sscanf(cmd, "LL_MESH_%x", &val) == 1)
+    else if (sscanf(cmd, "BL_MESH_%x", &val) == 1)
     {
         if (val == LORA_MESH_GATEWAY || val == LORA_MESH_NODE)
         {
             lora_cfg_set(1, (uint8_t)val);
             if (lora_cfg_save_persist() == 0)
-                bt_send_text("LL_ACK_MESH\r\n");
+                bt_send_text("BL_ACK_MESH\r\n");
             else
-                bt_send_text("LL_ACK_SAVE_ERR\r\n");
+                bt_send_text("BL_ACK_SAVE_ERR\r\n");
         }
         else
         {
-            bt_send_text("LL_ACK_ERR\r\n");
+            bt_send_text("BL_ACK_ERR\r\n");
         }
     }
-    else if (sscanf(cmd, "LL_NET_%x", &val) == 1)
+    else if (sscanf(cmd, "BL_NET_%x", &val) == 1)
     {
         lora_cfg_set(2, (uint8_t)val);
         if (lora_cfg_save_persist() == 0)
-            bt_send_text("LL_ACK_NET\r\n");
+            bt_send_text("BL_ACK_NET\r\n");
         else
-            bt_send_text("LL_ACK_SAVE_ERR\r\n");
+            bt_send_text("BL_ACK_SAVE_ERR\r\n");
     }
-    else if (sscanf(cmd, "LL_DEV_%x", &val) == 1)
+    else if (sscanf(cmd, "BL_DEV_%x", &val) == 1)
     {
         lora_cfg_set(3, (uint8_t)val);
         if (lora_cfg_save_persist() == 0)
-            bt_send_text("LL_ACK_DEV\r\n");
+            bt_send_text("BL_ACK_DEV\r\n");
         else
-            bt_send_text("LL_ACK_SAVE_ERR\r\n");
+            bt_send_text("BL_ACK_SAVE_ERR\r\n");
+    }
+    else if (sscanf(cmd, "BL_4G_%u", &val) == 1)
+    {
+        if (val >= 1 && val <= 65535)
+        {
+            server_port = (int)val;
+            bt_send_text("BL_ACK_4G\r\n");
+        }
+        else
+        {
+            bt_send_text("BL_ACK_ERR\r\n");
+        }
     }
     else
     {
-        bt_send_text("LL_ACK_ERR\r\n");
+        bt_send_text("BL_ACK_ERR\r\n");
     }
 }

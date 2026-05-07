@@ -325,18 +325,18 @@ static int debug_bt_handle_hex_payload_line(const char *line)
         return 0;
 
     /*
-     * 保留原来的 LL_ 控制命令：
-     * LL_0x00 / LL_0x01 / LL_0x02 / LL_0x03 / LL_0x04 / LL_0x0a
+     * 保留原来的 BL_ 控制命令：
+     * BL_0x00 / BL_0x01 / BL_0x02 / BL_0x03 / BL_0x04 / BL_0x0a
      * 以及你后面加的 LoRa 配置命令。
      */
-    if (strncmp(line, "LL_", 3) == 0)
+    if (strncmp(line, "BL_", 3) == 0)
         return 0;
 
     payload_len = debug_parse_plain_hex(line, payload, sizeof(payload));
     if (payload_len <= 0)
     {
         printf("[DEBUG BT] invalid pure hex payload: %s\n", line);
-        bt_send_text("LL_DEBUG_DATA_ERR\r\n");
+        bt_send_text("BL_DEBUG_DATA_ERR\r\n");
         return 1;
     }
 
@@ -361,7 +361,7 @@ static int debug_bt_handle_hex_payload_line(const char *line)
     lora_ret = debug_bt_send_lora_by_rule(payload, payload_len);
 
     snprintf(ack, sizeof(ack),
-             "LL_DEBUG_ACK,BD_Q=%d,BD_FLUSH=%d,4G=%d,LORA=%d\r\n",
+             "BL_DEBUG_ACK,BD_Q=%d,BD_FLUSH=%d,4G=%d,LORA=%d\r\n",
              bd_queue_ret, bd_flush_ret, eg_ret, lora_ret);
     bt_send_text(ack);
 
@@ -1379,15 +1379,15 @@ void *watchdog_feed_thread(void *arg)
 {
     while (!stop_flag)
     {
-        if (watchdog_fd != -1)
-        {
-            if (write(watchdog_fd, "\0", 1) != 1)
-            {
-                perror("watchdog write");
-            }
-        }
-        if (interruptible_sleep(5) < 0)
-            break;
+        // if (watchdog_fd != -1)
+        // {
+        //     if (write(watchdog_fd, "\0", 1) != 1)
+        //     {
+        //         perror("watchdog write");
+        //     }
+        // }
+        // if (interruptible_sleep(5) < 0)
+        //     break;
     }
     return NULL;
 }

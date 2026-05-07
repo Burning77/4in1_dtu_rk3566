@@ -332,20 +332,21 @@ int eg_is_network_available(void)
     }
     return 0;
 }
+int server_port = SERVER_PORT;
 int eg_connect(void)
 {
     const char *server_ip = SERVER_IP;
-    const int server_port = SERVER_PORT;
+    int port = server_port;
     char tcp_cmd[128];
     snprintf(tcp_cmd, sizeof(tcp_cmd), 
-             "AT+QIOPEN=1,0,\"TCP\",\"%s\",%d,0,0\r\n", server_ip, server_port);
+             "AT+QIOPEN=1,0,\"TCP\",\"%s\",%d,0,0\r\n", server_ip, port);
     char buf[256];
 
     // 先关闭可能存在的旧连接
     eg_send_cmd("AT+QICLOSE=0\r\n", "OK", 3);
     tcflush(eg_fd, TCIFLUSH);
 
-    printf("[EG] Connecting to %s:%d...\n", server_ip, server_port);
+    printf("[EG] Connecting to %s:%d...\n", server_ip, port);
     data_send((unsigned char *)tcp_cmd, strlen(tcp_cmd), EG_DEV);
 
     // 等待 +QIOPEN: 0,x （最长 60 秒，可被 stop_flag 中断）

@@ -919,10 +919,10 @@ int Lora_recv_packet(uint8_t *payload, uint8_t *out_len)
 
 	if (now != last_print)
 	{
-		printf("[LORA GPIO] DIO1=%d BUSY=%d IRQ=0x%04X\n",
-			   gpiod_line_get_value(line_dio1),
-			   gpiod_line_get_value(line_busy),
-			   GetIrqStatus());
+		// printf("[LORA GPIO] DIO1=%d BUSY=%d IRQ=0x%04X\n",
+		// 	   gpiod_line_get_value(line_dio1),
+		// 	   gpiod_line_get_value(line_busy),
+		// 	   GetIrqStatus());
 		last_print = now;
 	}
 	if (payload == NULL || out_len == NULL)
