@@ -21,6 +21,7 @@ extern struct gpiod_line *line_bt_pow;
 extern struct gpiod_line *line_4g_pow;
 extern struct gpiod_line *line_4g_boot;
 extern int eg_fd;
+
 uint16_t crc16(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -117,7 +118,7 @@ void rf_power_off(void)
 {
     gpio_set_value(0, line_bd_en);
     gpio_set_value(0, line_4g_pow);
-    gpio_set_value(1, line_bt_pow);
+    // gpio_set_value(1, line_bt_pow);
     gpio_set_value(1, line_4g_boot);
     sleep(1);
     printf("Powering off 4G module...\n");
@@ -155,40 +156,62 @@ static int is_garbage_data(serial_state_t *state)
 // 静态函数：提交一帧数据
 static void submit_frame(serial_state_t *state, frame_processor_ctx_t *ctx, const char *reason)
 {
-    // printf("[DEBUG SUBMIT] type=%d (0:RS485, 1:RS232, 2:BD), len=%d, reason=%s\n",
-    //        state->data_type, state->frame_len, reason);
+    (void)reason; // 当前 reason 参数未使用，保留以备未来扩展（如日志记录）
+    if (state == NULL || ctx == NULL)
+    {
+        return;
+    }
+
     if (state->frame_len <= 0)
     {
         return;
     }
 
-    // 过滤垃圾数据
     if (is_garbage_data(state))
     {
         printf("[%s FILTERED] Garbage data (len=%d, first_byte=0x%02X), skipping\n",
                state->tag, state->frame_len, state->frame_buf[0]);
         return;
     }
+    int offset = 0;
 
-    // 构造消息
-    fifo_message_t msg;
-    msg.type = state->data_type;
-    msg.len = state->frame_len;
-
-    // 安全检查：确保不会溢出
-    int copy_len = state->frame_len;
-    if (copy_len > BUFFER_SIZE)
+    while (offset < state->frame_len)
     {
-        copy_len = BUFFER_SIZE;
+        fifo_message_t msg;
+        memset(&msg, 0, sizeof(msg));
+
+        int chunk_len = state->frame_len - offset;
+        if (chunk_len > (int)sizeof(msg.data))
+        {
+            chunk_len = sizeof(msg.data);
+        }
+
+        msg.type = state->data_type;
+        msg.len = chunk_len;
+        memcpy(msg.data, state->frame_buf + offset, chunk_len);
+
+        pthread_mutex_lock(ctx->fifo_lock);
+        // memcpy(msg.data, state->frame_buf, copy_len);
+        if (kfifo_left(ctx->fifo) < sizeof(fifo_message_t))
+        {
+            pthread_mutex_unlock(ctx->fifo_lock);
+            printf("[%s WARN] fifo full, drop remaining %d bytes\n",
+                   state->tag, state->frame_len - offset);
+            break;
+        }
+
+        kfifo_put(ctx->fifo, (unsigned char *)&msg, sizeof(fifo_message_t));
+        pthread_cond_signal(ctx->fifo_not_empty);
+        pthread_mutex_unlock(ctx->fifo_lock);
+
+        offset += chunk_len;
     }
 
-    memcpy(msg.data, state->frame_buf, copy_len);
-
     // 加锁推入 kfifo
-    pthread_mutex_lock(ctx->fifo_lock);
-    kfifo_put(ctx->fifo, (unsigned char *)&msg, sizeof(fifo_message_t));
-    pthread_cond_signal(ctx->fifo_not_empty);
-    pthread_mutex_unlock(ctx->fifo_lock);
+    // pthread_mutex_lock(ctx->fifo_lock);
+    // kfifo_put(ctx->fifo, (unsigned char *)&msg, sizeof(fifo_message_t));
+    // pthread_cond_signal(ctx->fifo_not_empty);
+    // pthread_mutex_unlock(ctx->fifo_lock);
 
     // 打印调试信息
     // printf("[%s COMPLETE %d bytes (%s)]: ", state->tag, state->frame_len, reason);
@@ -218,7 +241,6 @@ void serial_state_init(serial_state_t *state, int data_type, const char *tag)
     state->data_type = data_type;
     state->tag = tag;
 }
-
 
 void process_serial_data(serial_state_t *state, unsigned char *read_buf, int read_len, int is_timeout_triggered, frame_processor_ctx_t *ctx)
 {
@@ -451,11 +473,21 @@ int bd_send_packet(const unsigned char *data, int len)
         p += sprintf(p, "%02X", data[i]);
     }
     // 构造报文
-    snprintf(msg, sizeof(msg), "$CCTCQ,4314513,2,1,2,,%s*", hex_buf);
+    snprintf(msg, sizeof(msg), "$CCTCQ,4314513,2,1,2,%s,0*", hex_buf);
     unsigned char cs = calc_checksum(msg);
     size_t msg_len = strlen(msg);
     snprintf(msg + msg_len, sizeof(msg) - msg_len, "%02X\r\n", cs);
-    return data_send((unsigned char *)msg, strlen(msg), BD_DEV);
+    int send_len = strlen(msg);
+    printf("[BD TX] %s", msg);
+    int ret = data_send((unsigned char *)msg, send_len, BD_DEV);
+
+    if (ret == send_len)
+    {
+        return 0;
+    }
+
+    printf("[BD] send failed or partial, ret=%d expected=%d\n", ret, send_len);
+    return -1;
 }
 /**
  * 从多个日志文件中读取新行，解析原始数据并打包成十六进制字符串（以逗号分隔）。

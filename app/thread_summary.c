@@ -541,7 +541,7 @@ void *serial_send_thread(void *arg)
         printf("[SEND] Sending command...\n");
         int resualt = data_send(test, strlen(test), RS232_DEV);
         int ret = data_send(CMD_STRING, strlen(CMD_STRING), RS485_DEV);
-        int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
+        // int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
         if (resualt < 0)
         {
             perror("rs232_send");
@@ -550,10 +550,10 @@ void *serial_send_thread(void *arg)
         {
             perror("rs485_send");
         }
-        if (res_bd < 0)
-        {
-            perror("bd_send");
-        }
+        // if (res_bd < 0)
+        // {
+        //     perror("bd_send");
+        // }
     }
     return NULL;
 }
@@ -1377,17 +1377,17 @@ void *main_send_thread(void *arg)
 
 void *watchdog_feed_thread(void *arg)
 {
-    while (!stop_flag)
-    {
-        // if (watchdog_fd != -1)
-        // {
-        //     if (write(watchdog_fd, "\0", 1) != 1)
-        //     {
-        //         perror("watchdog write");
-        //     }
-        // }
-        // if (interruptible_sleep(5) < 0)
-        //     break;
-    }
+    // while (!stop_flag)
+    // {
+    //     // if (watchdog_fd != -1)
+    //     // {
+    //     //     if (write(watchdog_fd, "\0", 1) != 1)
+    //     //     {
+    //     //         perror("watchdog write");
+    //     //     }
+    //     // }
+    //     // if (interruptible_sleep(5) < 0)
+    //     //     break;
+    // }
     return NULL;
 }

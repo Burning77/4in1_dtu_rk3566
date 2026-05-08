@@ -82,4 +82,5 @@ int load_offsets(const char *path, off_t *offsets, int count);
 int save_offsets(const char *path, const off_t *offsets, int count);
 uint16_t crc16(const uint8_t *data, uint16_t len);
 int push_lora_to_fifo(frame_processor_ctx_t *ctx, const uint8_t *data, uint8_t len);
+
 #endif
