@@ -17,6 +17,7 @@
 #define LORA_LOG_PATH "/home/cat/lora_data.log"
 #define LORA_CFG_PATH "/home/cat/lora_cfg.ini"
 #define LORA_CFG_TMP_PATH "/home/cat/lora_cfg.ini.tmp"
+#define BT_LOG_PATH "/home/cat/bt_data.log"
 #define RS485_DATA 0
 #define RS232_DATA 1
 #define BD_DATA 2
@@ -62,8 +63,7 @@ typedef struct
 int hex_to_bytes(const char *hex_str, unsigned char *out_bytes, int max_len);
 unsigned char calc_checksum(const char *s);
 int parse_log_line(const char *line, unsigned char *out_data, int max_len);
-void rf_power_on(void);
-void rf_power_off(void);
+
 // 初始化串口状态
 void serial_state_init(serial_state_t *state, int data_type, const char *tag);
 

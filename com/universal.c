@@ -15,12 +15,9 @@
 #define FRAME_TIMEOUT_MS 10
 #define BUFFER_SIZE 1024
 
-extern struct gpiod_line *line_bd_en;
-extern struct gpiod_line *line_bd_pow;
-extern struct gpiod_line *line_bt_pow;
-extern struct gpiod_line *line_4g_pow;
-extern struct gpiod_line *line_4g_boot;
-extern int eg_fd;
+
+
+
 
 uint16_t crc16(const uint8_t *data, uint16_t len)
 {
@@ -105,27 +102,6 @@ int parse_log_line(const char *line, unsigned char *out_data, int max_len)
     return count;
 }
 
-void rf_power_on(void)
-{
-    gpio_set_value(1, line_bd_en);
-    gpio_set_value(1, line_4g_pow);
-    gpio_set_value(0, line_bt_pow);
-    gpio_set_value(0, line_4g_boot);
-    sleep(1);
-    gpio_set_value(1, line_4g_boot);
-}
-void rf_power_off(void)
-{
-    gpio_set_value(0, line_bd_en);
-    gpio_set_value(0, line_4g_pow);
-    // gpio_set_value(1, line_bt_pow);
-    gpio_set_value(1, line_4g_boot);
-    sleep(1);
-    printf("Powering off 4G module...\n");
-    gpio_set_value(0, line_4g_boot);
-    sleep(1);
-    gpio_set_value(1, line_4g_boot);
-}
 // 静态函数：检查是否为垃圾数据
 static int is_garbage_data(serial_state_t *state)
 {
@@ -570,3 +546,4 @@ int pack_data_from_files(const char **paths, off_t *offsets, int file_count,
 
     return 0;
 }
+

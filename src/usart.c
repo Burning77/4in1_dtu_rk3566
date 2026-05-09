@@ -198,3 +198,39 @@ void uart_close(int fd)
         close(fd);
     fd = -1;
 }
+void uart_close_eg(void)
+{
+    if (eg_fd >= 0)
+    {
+        close(eg_fd);
+        eg_fd = -1;
+    }
+}
+
+int uart_reopen_eg(void)
+{
+    const int max_retry = 10;
+    const int retry_delay_sec = 2;
+
+    uart_close_eg();
+
+    for (int i = 0; i < max_retry; i++)
+    {
+        if (i > 0)
+            sleep(retry_delay_sec);
+
+        printf("[UART] Opening EG UART %s, retry %d/%d\n",
+               EG_DEV, i + 1, max_retry);
+
+        int fd = uart_init(EG_DEV, EG_BAUD);
+        if (fd >= 0)
+        {
+            eg_fd = fd;
+            printf("[UART] EG UART reopened, fd=%d\n", eg_fd);
+            return 0;
+        }
+    }
+
+    printf("[UART] Failed to reopen EG UART %s\n", EG_DEV);
+    return -1;
+}

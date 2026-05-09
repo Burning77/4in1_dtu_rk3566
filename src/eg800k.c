@@ -283,7 +283,7 @@ int eg_send_data(const unsigned char *data, int len)
             }
         }
     }
-    return -1;  // stop_flag 中断
+    return -1; // stop_flag 中断
 }
 
 // 检查 4G 网络是否可用（信号正常 + 已注册）
@@ -338,7 +338,7 @@ int eg_connect(void)
     const char *server_ip = SERVER_IP;
     int port = server_port;
     char tcp_cmd[128];
-    snprintf(tcp_cmd, sizeof(tcp_cmd), 
+    snprintf(tcp_cmd, sizeof(tcp_cmd),
              "AT+QIOPEN=1,0,\"TCP\",\"%s\",%d,0,0\r\n", server_ip, port);
     char buf[256];
 
@@ -470,5 +470,84 @@ int eg_reinit_pdp(void)
         return -1;
     }
     printf("[EG] PDP re-initialization successful\n");
+    return 0;
+}
+
+int main_ensure_eg_ready(int *eg_initialized,
+                         int *eg_connected,
+                         unsigned int *eg_power_generation_seen)
+{
+    if (!eg_power_is_on())
+    {
+        printf("[MAIN] Powering on EG module\n");
+        eg_power_on();
+    }
+
+    unsigned int current_generation = rf_power_get_generation();
+
+    if (eg_fd < 0 || *eg_power_generation_seen != current_generation)
+    {
+        printf("[MAIN] Reopening EG UART after EG power change\n");
+
+        if (uart_reopen_eg() != 0)
+        {
+            printf("[MAIN] EG UART reopen failed\n");
+            main_set_4g_available(0);
+            return -1;
+        }
+
+        *eg_initialized = 0;
+        *eg_connected = 0;
+        *eg_power_generation_seen = current_generation;
+    }
+
+    if (!*eg_initialized)
+    {
+        printf("[MAIN] Initializing 4G module...\n");
+
+        if (eg_init() != 0)
+        {
+            printf("[MAIN] 4G init failed\n");
+            main_set_4g_available(0);
+            return -1;
+        }
+
+        *eg_initialized = 1;
+        printf("[MAIN] 4G module initialized\n");
+    }
+
+    if (!*eg_connected)
+    {
+        for (int retry = 1; retry <= EG_CONNECT_MAX_RETRY && !stop_flag; retry++)
+        {
+            printf("[MAIN] Establishing TCP connection, retry %d/%d...\n",
+                   retry, EG_CONNECT_MAX_RETRY);
+
+            if (eg_connect() == 0)
+            {
+                *eg_connected = 1;
+                main_set_4g_available(1);
+                printf("[MAIN] TCP connected\n");
+                return 0;
+            }
+
+            printf("[MAIN] TCP connect failed, retry %d/%d\n",
+                   retry, EG_CONNECT_MAX_RETRY);
+
+            if (retry < EG_CONNECT_MAX_RETRY)
+            {
+                if (interruptible_sleep(30) < 0)
+                    return -1;
+            }
+        }
+
+        printf("[MAIN] TCP connect failed after %d retries\n",
+               EG_CONNECT_MAX_RETRY);
+
+        main_set_4g_available(0);
+        return -2;
+    }
+
+    main_set_4g_available(1);
     return 0;
 }

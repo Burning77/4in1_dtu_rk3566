@@ -2,6 +2,7 @@
 #include "../inc/watch_dog.h"
 #include "../inc/bluetooth.h"
 #include <stdatomic.h>
+#include "../inc/power.h"
 #define THREAD_COUNT 10
 typedef void *(*thread_func_t)(void *);
 volatile sig_atomic_t stop_flag = 0;

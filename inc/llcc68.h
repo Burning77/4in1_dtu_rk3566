@@ -54,7 +54,7 @@ typedef struct
 	uint8_t payload_size;
 } loRa_Para_t;
 
-bool Lora_init();
+bool Lora_init(loRa_Para_t *lp_pt);
 
 // 底层 SPI 传输
 void spi_transfer(uint8_t *tx_buf, uint8_t *rx_buf, uint32_t len);

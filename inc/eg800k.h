@@ -2,6 +2,7 @@
 #define __EG800K_H__
 #define SERVER_IP "115.120.239.161"
 #define SERVER_PORT 23738
+#define EG_CONNECT_MAX_RETRY 10
 // 定义模块状态
 typedef enum
 {
@@ -18,4 +19,7 @@ int bd_send_packet(const unsigned char *data, int len);
 int eg_is_network_available(void);
 int eg_reinit_pdp(void);
 int eg_connect(void);
+int main_ensure_eg_ready(int *eg_initialized,
+                         int *eg_connected,
+                         unsigned int *eg_power_generation_seen);
 #endif
