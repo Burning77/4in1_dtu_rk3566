@@ -30,7 +30,6 @@ void handle_signal(int sig);
 // 可被 stop_flag 中断的 sleep，返回 0 表示正常完成，-1 表示被中断
 int interruptible_sleep(int seconds);
 void *receive_thread(void *arg);
-void *serial_send_thread(void *arg);
 void *read_rtc_thread(void *arg);
 void *write_file_thread(void *arg);
 void *main_send_thread(void *arg);

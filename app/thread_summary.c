@@ -688,35 +688,6 @@ void *receive_thread(void *arg)
     return NULL;
 }
 
-// 发送线程
-void *serial_send_thread(void *arg)
-{
-    const char *test = "Hello from rs232!\r\n";
-    // 注意：不再从此线程发送 EG 命令，避免与 main_send_thread 的 eg_init() 冲突
-    // while (!stop_flag)
-    // {
-    //     if (interruptible_sleep(SEND_INTERVAL) < 0)
-    //         break;
-
-    //     printf("[SEND] Sending command...\n");
-    //     // int resualt = data_send(test, strlen(test), RS232_DEV);
-    //     int ret = data_send(CMD_STRING, strlen(CMD_STRING), RS485_DEV);
-    //     // int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
-    //     // if (resualt < 0)
-    //     // {
-    //     //     perror("rs232_send");
-    //     // }
-    //     if (ret < 0)
-    //     {
-    //         perror("rs485_send");
-    //     }
-    //     // if (res_bd < 0)
-    //     // {
-    //     //     perror("bd_send");
-    //     // }
-    // }
-    return NULL;
-}
 void *read_rtc_thread(void *arg)
 {
     int year, month, day, hour, min, sec;
@@ -1251,7 +1222,8 @@ void *main_send_thread(void *arg)
 
     load_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
     unsigned int wakeup_seq_seen;
-
+    time_t next_4g_try_time = 0;
+    int eg_ready_fail_count = 0;
     pthread_mutex_lock(&g_data_wakeup_mutex);
     wakeup_seq_seen = g_data_wakeup_seq;
     pthread_mutex_unlock(&g_data_wakeup_mutex);
@@ -1270,10 +1242,12 @@ void *main_send_thread(void *arg)
 
         if (entry_count == 0)
         {
+            // printf("[MAIN] No pending data, powering off communication modules\n");
             main_all_power_down(&eg_initialized,
                                 &eg_connected,
                                 &eg_power_generation_seen);
-
+            eg_ready_fail_count = 0;
+            next_4g_try_time = 0;
             main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
             continue;
         }
@@ -1310,8 +1284,9 @@ void *main_send_thread(void *arg)
         {
             bd_power_off();
         }
-
-        if (need_4g)
+        time_t now = time(NULL);
+        int allow_4g_try = need_4g && (now >= next_4g_try_time);
+        if (allow_4g_try)
         {
             int connect_max_retry = (send_path == SEND_PATH_4G_ONLY) ? EG_CONNECT_MAX_RETRY : 1;
             int eg_ready_ret = main_ensure_eg_ready(&eg_initialized,
@@ -1321,11 +1296,22 @@ void *main_send_thread(void *arg)
 
             if (eg_ready_ret != 0)
             {
-                if (eg_ready_ret == -2)
+                eg_ready_fail_count++;
+                next_4g_try_time = time(NULL) + 60;
+
+                eg_connected = 0;
+                main_set_4g_available(0);
+
+                printf("[MAIN] 4G init/connect failed %d/10, ret=%d\n",
+                       eg_ready_fail_count, eg_ready_ret);
+
+                if (eg_ready_fail_count >= 10)
                 {
-                    main_eg_power_down(&eg_initialized,
-                                       &eg_connected,
-                                       &eg_power_generation_seen);
+                    printf("[MAIN] 4G failed 10 times, power down and wait for new data\n");
+
+                    main_all_power_down(&eg_initialized,
+                                        &eg_connected,
+                                        &eg_power_generation_seen);
                 }
 
                 if (send_path == SEND_PATH_4G_ONLY)
@@ -1335,6 +1321,11 @@ void *main_send_thread(void *arg)
                     interruptible_sleep(10);
                     continue;
                 }
+            }
+            else
+            {
+                eg_ready_fail_count = 0;
+                next_4g_try_time = 0;
             }
         }
         else
@@ -1484,6 +1475,7 @@ void *main_send_thread(void *arg)
         {
             memcpy(offsets, pending_offsets, sizeof(offsets));
             save_offsets(OFFSET_FILE_MAIN, offsets, 4);
+            continue;
         }
         else
         {

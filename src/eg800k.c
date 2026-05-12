@@ -151,7 +151,9 @@ int eg_init(void)
         printf("[EG] Network registration failed\n");
         return -1;
     }
-
+    eg_send_cmd("AT+QICLOSE=0\r\n", "OK", 5);
+    eg_send_cmd("AT+QIDEACT=1\r\n", "OK", 10);
+    sleep(1);
     // 5. 配置 APN（请根据 SIM 卡运营商修改）
     // 中国联通: "UNINET", 中国移动: "CMNET", 中国电信: "CTNET"
     if (eg_send_cmd("AT+QICSGP=1,1,\"CMNET\",\"\",\"\",1\r\n", "OK", 5) != 0)
