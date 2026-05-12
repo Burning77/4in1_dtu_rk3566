@@ -475,7 +475,8 @@ int eg_reinit_pdp(void)
 
 int main_ensure_eg_ready(int *eg_initialized,
                          int *eg_connected,
-                         unsigned int *eg_power_generation_seen)
+                         unsigned int *eg_power_generation_seen,
+                         int connect_max_retry)
 {
     if (!eg_power_is_on())
     {
@@ -518,10 +519,10 @@ int main_ensure_eg_ready(int *eg_initialized,
 
     if (!*eg_connected)
     {
-        for (int retry = 1; retry <= EG_CONNECT_MAX_RETRY && !stop_flag; retry++)
+        for (int retry = 1; retry <= connect_max_retry && !stop_flag; retry++)
         {
             printf("[MAIN] Establishing TCP connection, retry %d/%d...\n",
-                   retry, EG_CONNECT_MAX_RETRY);
+                   retry, connect_max_retry);
 
             if (eg_connect() == 0)
             {
@@ -532,9 +533,9 @@ int main_ensure_eg_ready(int *eg_initialized,
             }
 
             printf("[MAIN] TCP connect failed, retry %d/%d\n",
-                   retry, EG_CONNECT_MAX_RETRY);
+                   retry, connect_max_retry);
 
-            if (retry < EG_CONNECT_MAX_RETRY)
+            if (retry < connect_max_retry)
             {
                 if (interruptible_sleep(30) < 0)
                     return -1;
@@ -542,7 +543,7 @@ int main_ensure_eg_ready(int *eg_initialized,
         }
 
         printf("[MAIN] TCP connect failed after %d retries\n",
-               EG_CONNECT_MAX_RETRY);
+               connect_max_retry);
 
         main_set_4g_available(0);
         return -2;

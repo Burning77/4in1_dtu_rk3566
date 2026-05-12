@@ -21,5 +21,6 @@ int eg_reinit_pdp(void);
 int eg_connect(void);
 int main_ensure_eg_ready(int *eg_initialized,
                          int *eg_connected,
-                         unsigned int *eg_power_generation_seen);
+                         unsigned int *eg_power_generation_seen,
+                         int connect_max_retry);
 #endif

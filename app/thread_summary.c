@@ -5,6 +5,9 @@
 #include <sys/ioctl.h>
 #include "../inc/power.h"
 #define DEBUG
+#define MAIN_PATH_COUNT 4
+#define MAIN_IDLE_WAKE_POLL_SEC 60
+#define MAIN_SEND_RETRY_WAIT_SEC 10
 extern struct kfifo data_fifo;
 
 static pthread_mutex_t fifo_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -41,6 +44,10 @@ static dtu_status_t g_dtu_status = {0};
 static pthread_mutex_t g_status_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t g_lora_cfg_mutex = PTHREAD_MUTEX_INITIALIZER;
 static time_t g_bt_start_time = 0;
+static pthread_mutex_t g_debug_bt_bd_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_data_wakeup_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t g_data_wakeup_cond = PTHREAD_COND_INITIALIZER;
+static unsigned int g_data_wakeup_seq = 0;
 extern int rs485_fd;
 extern int rs232_fd;
 extern int bd_fd;
@@ -48,6 +55,35 @@ extern int bt_fd;
 extern int eg_fd;
 extern int watchdog_fd;
 extern loRa_Para_t my_lora_config;
+
+static void main_wait_for_data_wakeup(unsigned int *seen_seq, int timeout_sec)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += timeout_sec;
+
+    pthread_mutex_lock(&g_data_wakeup_mutex);
+
+    while (!stop_flag && g_data_wakeup_seq == *seen_seq)
+    {
+        int ret = pthread_cond_timedwait(&g_data_wakeup_cond,
+                                         &g_data_wakeup_mutex,
+                                         &ts);
+        if (ret == ETIMEDOUT)
+            break;
+    }
+
+    if (g_data_wakeup_seq != *seen_seq)
+    {
+        printf("[MAIN] Data wakeup received, seq=%u -> %u\n",
+               *seen_seq, g_data_wakeup_seq);
+    }
+
+    *seen_seq = g_data_wakeup_seq;
+    pthread_mutex_unlock(&g_data_wakeup_mutex);
+}
+
 #ifdef DEBUG
 static volatile int g_debug_eg_connected = 0;
 static pthread_mutex_t g_debug_eg_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -67,10 +103,7 @@ static int g_debug_bt_bd_head = 0;
 static int g_debug_bt_bd_tail = 0;
 static int g_debug_bt_bd_count = 0;
 static time_t g_debug_bt_last_bd_send_time = 0;
-static pthread_mutex_t g_debug_bt_bd_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t g_data_wakeup_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t g_data_wakeup_cond = PTHREAD_COND_INITIALIZER;
-static unsigned int g_data_wakeup_seq = 0;
+
 static int debug_bt_push_to_fifo(const uint8_t *data, int len)
 {
     fifo_message_t msg;
@@ -535,7 +568,7 @@ void *receive_thread(void *arg)
         int cur_rs485_fd = get_fd(RS485_DEV);
         int cur_rs232_fd = get_fd(RS232_DEV);
         int cur_bd_fd = get_fd(BD_DEV);
-        int cur_eg_fd = eg_fd;
+        // int cur_eg_fd = eg_fd;
 
         FD_ZERO(&read_fds);
         max_fd = -1;
@@ -561,12 +594,12 @@ void *receive_thread(void *arg)
                 max_fd = cur_bd_fd;
         }
 
-        if (cur_eg_fd >= 0)
-        {
-            FD_SET(cur_eg_fd, &read_fds);
-            if (cur_eg_fd > max_fd)
-                max_fd = cur_eg_fd;
-        }
+        // if (cur_eg_fd >= 0)
+        // {
+        //     FD_SET(cur_eg_fd, &read_fds);
+        //     if (cur_eg_fd > max_fd)
+        //         max_fd = cur_eg_fd;
+        // }
 
         if (max_fd < 0)
         {
@@ -583,14 +616,30 @@ void *receive_thread(void *arg)
         {
             if (errno == EINTR)
                 continue;
+
+            if (errno == EBADF)
+            {
+                printf("[RECV] select EBADF, fd changed, retry\n");
+                usleep(200 * 1000);
+                continue;
+            }
+
             perror("select");
-            break;
+            usleep(200 * 1000);
+            continue;
         }
 
         int rs485_read_len = 0;
         if (cur_rs485_fd >= 0 && FD_ISSET(cur_rs485_fd, &read_fds))
         {
             rs485_read_len = data_recv(buf, sizeof(buf) - 1, RS485_DEV);
+            if (rs485_read_len > 0)
+            {
+                printf("[RS485 RX] len=%d: ", rs485_read_len);
+                for (int i = 0; i < rs485_read_len; i++)
+                    printf("%02X ", buf[i]);
+                printf("\n");
+            }
         }
         process_serial_data(&rs485_state, buf, rs485_read_len, (ret == 0), &ctx);
 
@@ -608,27 +657,27 @@ void *receive_thread(void *arg)
         }
         process_serial_data(&bd_state, buf, bd_read_len, (ret == 0), &ctx);
 
-        int eg_read_len = 0;
-        if (cur_eg_fd >= 0 && FD_ISSET(cur_eg_fd, &read_fds))
-        {
-            eg_read_len = data_recv(buf, sizeof(buf) - 1, EG_DEV);
+        // int eg_read_len = 0;
+        // if (cur_eg_fd >= 0 && FD_ISSET(cur_eg_fd, &read_fds))
+        // {
+        //     eg_read_len = data_recv(buf, sizeof(buf) - 1, EG_DEV);
 
-            if (eg_read_len > 0)
-            {
-                buf[eg_read_len] = '\0';
-                printf("[EG DEBUG] Received: [%s]\n", buf);
+        //     if (eg_read_len > 0)
+        //     {
+        //         buf[eg_read_len] = '\0';
+        //         printf("[EG DEBUG] Received: [%s]\n", buf);
 
-                char *urc = strstr((char *)buf, "+QIURC: \"pdpdeact\"");
-                if (urc != NULL)
-                {
-                    pthread_mutex_lock(&g_pdp_mutex);
-                    g_pdp_deact = 1;
-                    pthread_mutex_unlock(&g_pdp_mutex);
-                    printf("[EG] Received +QIURC: pdpdeact, will re-init PDP\n");
-                }
-            }
-        }
-        process_serial_data(&eg_state, buf, eg_read_len, (ret == 0), &ctx);
+        //         char *urc = strstr((char *)buf, "+QIURC: \"pdpdeact\"");
+        //         if (urc != NULL)
+        //         {
+        //             pthread_mutex_lock(&g_pdp_mutex);
+        //             g_pdp_deact = 1;
+        //             pthread_mutex_unlock(&g_pdp_mutex);
+        //             printf("[EG] Received +QIURC: pdpdeact, will re-init PDP\n");
+        //         }
+        //     }
+        // }
+        // process_serial_data(&eg_state, buf, eg_read_len, (ret == 0), &ctx);
     }
 
     // 退出前处理残留帧
@@ -644,28 +693,28 @@ void *serial_send_thread(void *arg)
 {
     const char *test = "Hello from rs232!\r\n";
     // 注意：不再从此线程发送 EG 命令，避免与 main_send_thread 的 eg_init() 冲突
-    while (!stop_flag)
-    {
-        if (interruptible_sleep(SEND_INTERVAL) < 0)
-            break;
+    // while (!stop_flag)
+    // {
+    //     if (interruptible_sleep(SEND_INTERVAL) < 0)
+    //         break;
 
-        printf("[SEND] Sending command...\n");
-        int resualt = data_send(test, strlen(test), RS232_DEV);
-        int ret = data_send(CMD_STRING, strlen(CMD_STRING), RS485_DEV);
-        // int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
-        if (resualt < 0)
-        {
-            perror("rs232_send");
-        }
-        if (ret < 0)
-        {
-            perror("rs485_send");
-        }
-        // if (res_bd < 0)
-        // {
-        //     perror("bd_send");
-        // }
-    }
+    //     printf("[SEND] Sending command...\n");
+    //     // int resualt = data_send(test, strlen(test), RS232_DEV);
+    //     int ret = data_send(CMD_STRING, strlen(CMD_STRING), RS485_DEV);
+    //     // int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
+    //     // if (resualt < 0)
+    //     // {
+    //     //     perror("rs232_send");
+    //     // }
+    //     if (ret < 0)
+    //     {
+    //         perror("rs485_send");
+    //     }
+    //     // if (res_bd < 0)
+    //     // {
+    //     //     perror("bd_send");
+    //     // }
+    // }
     return NULL;
 }
 void *read_rtc_thread(void *arg)
@@ -782,9 +831,9 @@ void *write_file_thread(void *arg)
 
         fputs(log_line, *fp);
         fflush(*fp); // 可改为批量 flush
-        if (msg.type == RS485_DATA)
+        if (msg.type == RS485_DATA || msg.type == BT_DATA)
         {
-            notify_data_wakeup("RS485");
+            notify_data_wakeup(msg.type == RS485_DATA ? "RS485" : "BT");
         }
     }
 
@@ -1009,7 +1058,7 @@ void *bt_comm_thread(void *arg)
             int n = read(bt_fd, recv_buf + recv_len, sizeof(recv_buf) - 1 - recv_len);
             if (n > 0)
             {
-                notify_data_wakeup("BT");
+                // notify_data_wakeup("BT");
 
                 if (!rf_power_is_on())
                 {
@@ -1188,8 +1237,8 @@ void *main_send_thread(void *arg)
 {
     (void)arg;
 
-    const char *paths[] = {RS485_LOG_PATH, RS232_LOG_PATH, LORA_LOG_PATH, BT_LOG_PATH};
-    off_t offsets[4] = {0, 0, 0, 0};
+    const char *paths[MAIN_PATH_COUNT] = {RS485_LOG_PATH, RS232_LOG_PATH, LORA_LOG_PATH, BT_LOG_PATH};
+    off_t offsets[MAIN_PATH_COUNT] = {0, 0, 0, 0};
     int hex_len, entry_count;
     char hex_buf[EG_MSG_LEN + 64];
 
@@ -1200,14 +1249,18 @@ void *main_send_thread(void *arg)
     int eg_connected = 0;
     unsigned int eg_power_generation_seen = rf_power_get_generation();
 
-    load_offsets(OFFSET_FILE_MAIN, offsets, 3);
+    load_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
+    unsigned int wakeup_seq_seen;
 
+    pthread_mutex_lock(&g_data_wakeup_mutex);
+    wakeup_seq_seen = g_data_wakeup_seq;
+    pthread_mutex_unlock(&g_data_wakeup_mutex);
     while (!stop_flag)
     {
-        off_t pending_offsets[4];
+        off_t pending_offsets[MAIN_PATH_COUNT];
         memcpy(pending_offsets, offsets, sizeof(offsets));
 
-        if (pack_data_from_files(paths, pending_offsets, 4, EG_MSG_LEN,
+        if (pack_data_from_files(paths, pending_offsets, MAIN_PATH_COUNT, EG_MSG_LEN,
                                  hex_buf, &hex_len, &entry_count) != 0)
         {
             printf("[MAIN] pack_data_from_files failed\n");
@@ -1221,7 +1274,7 @@ void *main_send_thread(void *arg)
                                 &eg_connected,
                                 &eg_power_generation_seen);
 
-            interruptible_sleep(10);
+            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
             continue;
         }
 
@@ -1260,9 +1313,11 @@ void *main_send_thread(void *arg)
 
         if (need_4g)
         {
+            int connect_max_retry = (send_path == SEND_PATH_4G_ONLY) ? EG_CONNECT_MAX_RETRY : 1;
             int eg_ready_ret = main_ensure_eg_ready(&eg_initialized,
                                                     &eg_connected,
-                                                    &eg_power_generation_seen);
+                                                    &eg_power_generation_seen,
+                                                    connect_max_retry);
 
             if (eg_ready_ret != 0)
             {
@@ -1444,7 +1499,7 @@ void *main_send_thread(void *arg)
                         &eg_connected,
                         &eg_power_generation_seen);
 
-    save_offsets(OFFSET_FILE_MAIN, offsets, 4);
+    save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
     return NULL;
 }
 
