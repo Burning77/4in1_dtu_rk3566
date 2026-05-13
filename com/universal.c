@@ -12,7 +12,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <string.h>
-#define FRAME_TIMEOUT_MS 20
+#define FRAME_TIMEOUT_MS 10
 #define BUFFER_SIZE 1024
 #define LOG_COMPACT_MAX_LINE 1024
 #define LOG_COMPACT_MAX_KEEP_FRAMES 32

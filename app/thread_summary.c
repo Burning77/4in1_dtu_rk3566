@@ -56,7 +56,33 @@ extern int bt_fd;
 extern int eg_fd;
 extern int watchdog_fd;
 extern loRa_Para_t my_lora_config;
+static int main_pack_pending(const char **paths,
+                             const off_t *offsets,
+                             off_t *pending_offsets,
+                             int max_hex_len,
+                             char *hex_buf,
+                             unsigned char *raw_buf,
+                             int raw_buf_size,
+                             int *raw_len,
+                             int *entry_count)
+{
+    memcpy(pending_offsets, offsets, sizeof(off_t) * MAIN_PATH_COUNT);
 
+    if (pack_data_from_files(paths, pending_offsets, MAIN_PATH_COUNT,
+                             max_hex_len, hex_buf, raw_len, entry_count) != 0)
+    {
+        return -1;
+    }
+
+    if (*entry_count == 0)
+    {
+        *raw_len = 0;
+        return 0;
+    }
+
+    *raw_len = hex_to_bytes(hex_buf, raw_buf, raw_buf_size);
+    return (*raw_len > 0) ? 0 : -1;
+}
 static void main_wait_for_data_wakeup(unsigned int *seen_seq, int timeout_sec)
 {
     struct timespec ts;
@@ -1237,133 +1263,110 @@ void *main_send_thread(void *arg)
 {
     (void)arg;
 
-    const char *paths[MAIN_PATH_COUNT] = {RS485_LOG_PATH, RS232_LOG_PATH, LORA_LOG_PATH, BT_LOG_PATH};
-    off_t offsets[MAIN_PATH_COUNT] = {0, 0, 0, 0};
-    int hex_len, entry_count;
-    char hex_buf[EG_MAX_HEX_LEN];
-    unsigned char raw_data[EG_MSG_LEN];
+    const char *paths[MAIN_PATH_COUNT] = {
+        RS485_LOG_PATH,
+        RS232_LOG_PATH,
+        LORA_LOG_PATH,
+        BT_LOG_PATH};
+
+    off_t offsets[MAIN_PATH_COUNT] = {0};
+    off_t pending_offsets[MAIN_PATH_COUNT];
+
+    char hex_buf[EG_MAX_HEX_LEN + 1];
+    char bd_hex_buf[BD_MAX_HEX_LEN + 1];
+
+    unsigned char raw_data[(EG_MAX_HEX_LEN / 2) + 1];
+    unsigned char bd_raw_data[BD_MAX_RAW_LEN];
+
+    int hex_len = 0;
+    int entry_count = 0;
+    int raw_len = 0;
+
+    int bd_hex_len = 0;
+    int bd_entry_count = 0;
+    int bd_raw_len = 0;
+
     time_t last_bd_send_time = 0;
-    const int BD_SEND_INTERVAL = 60;
+    time_t next_4g_try_time = 0;
 
     int eg_initialized = 0;
     int eg_connected = 0;
+    int eg_ready_fail_count = 0;
+    int bd_fail_count = 0;
+    int bd_fallback_active = 0;
+
     unsigned int eg_power_generation_seen = rf_power_get_generation();
+    unsigned int wakeup_seq_seen = 0;
+
+    main_send_state_t state = MAIN_ST_IDLE;
+    send_path_t send_path = SEND_PATH_AUTO;
 
     load_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
-    unsigned int wakeup_seq_seen;
-    time_t next_4g_try_time = 0;
-    int eg_ready_fail_count = 0;
+
     pthread_mutex_lock(&g_data_wakeup_mutex);
     wakeup_seq_seen = g_data_wakeup_seq;
     pthread_mutex_unlock(&g_data_wakeup_mutex);
-    bd_segment_task_t bd_task;
-    off_t bd_task_commit_offsets[MAIN_PATH_COUNT];
-    off_t pending_offsets[MAIN_PATH_COUNT];
-    bd_task_clear(&bd_task);
-    memset(bd_task_commit_offsets, 0, sizeof(bd_task_commit_offsets));
     while (!stop_flag)
     {
-        if (bd_task.active)
+        switch (state)
         {
-            main_ensure_bd_ready();
-
-            int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
-
-            if (bd_ret == BD_TASK_DONE)
+        case MAIN_ST_IDLE:
+            if (main_pack_pending(paths, offsets, pending_offsets,
+                                  EG_MAX_HEX_LEN, hex_buf,
+                                  raw_data, sizeof(raw_data),
+                                  &raw_len, &entry_count) != 0)
             {
-                memcpy(offsets, bd_task_commit_offsets, sizeof(offsets));
-
-                for (int i = 0; i < MAIN_PATH_COUNT; i++)
-                    compact_log_file(paths[i], &offsets[i], 10);
-
-                save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
-
-                g_send_count_bd++;
-                bd_task_clear(&bd_task);
-
-                printf("[MAIN] BD task complete, offsets advanced\n");
-                continue;
+                printf("[MAIN] pack failed\n");
+                main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+                break;
             }
 
-            if (bd_ret == BD_TASK_FAILED)
+            if (entry_count == 0)
             {
-                g_send_fail_count++;
-                printf("[MAIN] BD task failed, offsets not advanced\n");
+                bd_fallback_active = 0;
+                state = MAIN_ST_POWER_DOWN;
+                break;
             }
 
-            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
-            usleep(200 * 1000);
-            continue;
-        }
+            send_path = bt_get_send_path();
 
-        memcpy(pending_offsets, offsets, sizeof(offsets));
-        if (pack_data_from_files(paths, pending_offsets, MAIN_PATH_COUNT, EG_MAX_HEX_LEN,
-                                 hex_buf, &hex_len, &entry_count) != 0)
+            if (bd_fallback_active ||
+                send_path == SEND_PATH_BD_ONLY ||
+                send_path == SEND_PATH_BD_FIRST)
+            {
+                state = MAIN_ST_TRY_BD;
+            }
+            else
+            {
+                state = MAIN_ST_TRY_4G;
+            }
+            break;
+
+        case MAIN_ST_TRY_4G:
         {
-            printf("[MAIN] pack_data_from_files failed\n");
-            interruptible_sleep(10);
-            continue;
-        }
+            time_t now = time(NULL);
 
-        if (entry_count == 0)
-        {
-            // printf("[MAIN] No pending data, powering off communication modules\n");
-            main_all_power_down(&eg_initialized,
-                                &eg_connected,
-                                &eg_power_generation_seen);
-            eg_ready_fail_count = 0;
-            next_4g_try_time = 0;
-            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
-            usleep(200 * 1000);
-            continue;
-        }
+            if (send_path == SEND_PATH_BD_ONLY)
+            {
+                state = MAIN_ST_TRY_BD;
+                break;
+            }
 
-        int raw_len = hex_to_bytes(hex_buf, raw_data, sizeof(raw_data));
-        if (raw_len <= 0)
-        {
-            printf("[MAIN] hex_to_bytes failed\n");
-            interruptible_sleep(10);
-            continue;
-        }
+            if (now < next_4g_try_time)
+            {
+                state = (send_path == SEND_PATH_4G_ONLY) ? MAIN_ST_IDLE : MAIN_ST_TRY_BD;
+                break;
+            }
 
-        send_path_t send_path = bt_get_send_path();
-        int send_ok = 0;
-        int tried_4g = 0;
-        int tried_bd = 0;
-
-        int need_4g = (send_path == SEND_PATH_4G_ONLY ||
-                       send_path == SEND_PATH_4G_FIRST ||
-                       send_path == SEND_PATH_AUTO ||
-                       send_path == SEND_PATH_BD_FIRST);
-
-        int need_bd = (send_path == SEND_PATH_BD_ONLY ||
-                       send_path == SEND_PATH_BD_FIRST ||
-                       send_path == SEND_PATH_AUTO ||
-                       send_path == SEND_PATH_4G_FIRST);
-
-        if (need_bd)
-        {
-            main_ensure_bd_ready();
-        }
-        else
-        {
-            bd_power_off();
-        }
-        time_t now = time(NULL);
-        int allow_4g_try = need_4g && (now >= next_4g_try_time);
-        if (allow_4g_try)
-        {
-            int connect_max_retry = (send_path == SEND_PATH_4G_ONLY) ? EG_CONNECT_MAX_RETRY : 1;
             int eg_ready_ret = main_ensure_eg_ready(&eg_initialized,
                                                     &eg_connected,
                                                     &eg_power_generation_seen,
-                                                    connect_max_retry);
+                                                    1);
 
             if (eg_ready_ret != 0)
             {
                 eg_ready_fail_count++;
-                next_4g_try_time = time(NULL) + 60;
-
+                next_4g_try_time = time(NULL) + MAIN_4G_COOLDOWN_SEC;
                 eg_connected = 0;
                 main_set_4g_available(0);
 
@@ -1372,236 +1375,141 @@ void *main_send_thread(void *arg)
 
                 if (eg_ready_fail_count >= 10)
                 {
-                    printf("[MAIN] 4G failed 10 times, power down and wait for new data\n");
-
-                    main_all_power_down(&eg_initialized,
-                                        &eg_connected,
-                                        &eg_power_generation_seen);
+                    state = MAIN_ST_POWER_DOWN;
+                    break;
                 }
 
-                if (send_path == SEND_PATH_4G_ONLY)
-                {
-                    g_send_fail_count++;
-                    printf("[MAIN] 4G_ONLY failed, offsets not advanced\n");
-                    interruptible_sleep(10);
-                    continue;
-                }
+                state = (send_path == SEND_PATH_4G_ONLY) ? MAIN_ST_IDLE : MAIN_ST_TRY_BD;
+                break;
+            }
+
+            eg_ready_fail_count = 0;
+            next_4g_try_time = 0;
+
+            if (eg_send_data(raw_data, raw_len) == 0)
+            {
+                memcpy(offsets, pending_offsets, sizeof(offsets));
+
+                for (int i = 0; i < MAIN_PATH_COUNT; i++)
+                    compact_log_file(paths[i], &offsets[i], 10);
+
+                save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
+
+                g_send_count_4g++;
+                printf("[MAIN] Sent %d bytes via 4G\n", raw_len);
+                state = MAIN_ST_IDLE;
             }
             else
             {
-                eg_ready_fail_count = 0;
-                next_4g_try_time = 0;
-            }
-        }
-        else
-        {
-            main_eg_power_down(&eg_initialized,
-                               &eg_connected,
-                               &eg_power_generation_seen);
-        }
+                eg_connected = 0;
+                main_set_4g_available(0);
+                printf("[MAIN] 4G send failed\n");
 
-        int can_use_4g = (need_4g && eg_connected);
-
-        switch (send_path)
-        {
-        case SEND_PATH_4G_ONLY:
-            if (can_use_4g)
-            {
-                tried_4g = 1;
-                if (eg_send_data(raw_data, raw_len) == 0)
-                {
-                    send_ok = 1;
-                    g_send_count_4g++;
-                    printf("[MAIN] Sent %d bytes via 4G (4G_ONLY)\n", raw_len);
-                }
-                else
-                {
-                    eg_connected = 0;
-                    main_set_4g_available(0);
-                    printf("[MAIN] 4G_ONLY send failed\n");
-                }
+                state = (send_path == SEND_PATH_4G_ONLY) ? MAIN_ST_IDLE : MAIN_ST_TRY_BD;
             }
             break;
+        }
 
-        case SEND_PATH_BD_ONLY:
+        case MAIN_ST_TRY_BD:
         {
-            time_t now = time(NULL);
-
-            if (now - last_bd_send_time >= BD_SEND_INTERVAL)
+            bd_fallback_active = 1;
+            if (eg_power_is_on() || eg_connected || eg_initialized)
             {
-                tried_bd = 1;
-                if (bd_task_start(&bd_task, raw_data, raw_len) == 0)
-                {
-                    memcpy(bd_task_commit_offsets, pending_offsets, sizeof(bd_task_commit_offsets));
+                printf("[MAIN] BD mode active, powering down EG\n");
 
-                    int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
+                main_eg_power_down(&eg_initialized,
+                                   &eg_connected,
+                                   &eg_power_generation_seen);
+            }
+            if (main_pack_pending(paths, offsets, pending_offsets,
+                                  BD_MAX_HEX_LEN, bd_hex_buf,
+                                  bd_raw_data, sizeof(bd_raw_data),
+                                  &bd_raw_len, &bd_entry_count) != 0)
+            {
+                printf("[MAIN] BD pack failed\n");
+                state = MAIN_ST_BD_WAIT;
+                break;
+            }
 
-                    if (bd_ret == BD_TASK_DONE)
-                    {
-                        send_ok = 1;
-                        g_send_count_bd++;
-                        printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
-                    }
-                    else if (bd_ret == BD_TASK_PENDING)
-                    {
-                        printf("[MAIN] BD task pending, offsets not advanced yet\n");
-                        main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
-                        continue;
-                    }
-                    else
-                    {
-                        printf("[MAIN] BD task first segment failed\n");
-                    }
-                }
-                else
-                {
-                    printf("[MAIN] BD task start failed\n");
-                }
+            if (bd_entry_count == 0)
+            {
+                bd_fallback_active = 0;
+                bd_fail_count = 0;
+                state = MAIN_ST_IDLE;
+                break;
+            }
+
+            time_t now = time(NULL);
+            if (last_bd_send_time != 0 &&
+                now - last_bd_send_time < BD_SEND_INTERVAL_SEC)
+            {
+                state = MAIN_ST_BD_WAIT;
+                break;
+            }
+
+            main_ensure_bd_ready();
+
+            if (bd_send_packet(bd_raw_data, bd_raw_len) == 0)
+            {
+                memcpy(offsets, pending_offsets, sizeof(offsets));
+
+                for (int i = 0; i < MAIN_PATH_COUNT; i++)
+                    compact_log_file(paths[i], &offsets[i], 10);
+
+                save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
+
+                last_bd_send_time = time(NULL);
+                bd_fail_count = 0;
+                g_send_count_bd++;
+
+                printf("[MAIN] Sent %d bytes via BD segment, offsets advanced\n",
+                       bd_raw_len);
+
+                state = MAIN_ST_TRY_BD;
             }
             else
             {
-                printf("[MAIN] BD_ONLY interval not reached (%ld sec left)\n",
-                       BD_SEND_INTERVAL - (now - last_bd_send_time));
-            }
-            break;
-        }
+                bd_fail_count++;
+                g_send_fail_count++;
 
-        case SEND_PATH_BD_FIRST:
-        {
-            time_t now = time(NULL);
+                printf("[MAIN] BD segment failed %d/%d\n",
+                       bd_fail_count, BD_FAIL_MAX);
 
-            if (now - last_bd_send_time >= BD_SEND_INTERVAL)
-            {
-                tried_bd = 1;
-                if (bd_task_start(&bd_task, raw_data, raw_len) == 0)
+                if (bd_fail_count >= BD_FAIL_MAX)
                 {
-                    memcpy(bd_task_commit_offsets, pending_offsets, sizeof(bd_task_commit_offsets));
-
-                    int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
-
-                    if (bd_ret == BD_TASK_DONE)
-                    {
-                        send_ok = 1;
-                        g_send_count_bd++;
-                        printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
-                    }
-                    else if (bd_ret == BD_TASK_PENDING)
-                    {
-                        printf("[MAIN] BD task pending, offsets not advanced yet\n");
-                        main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
-                        continue;
-                    }
-                    else
-                    {
-                        printf("[MAIN] BD task first segment failed\n");
-                    }
+                    state = MAIN_ST_POWER_DOWN;
                 }
                 else
                 {
-                    printf("[MAIN] BD task start failed\n");
-                }
-            }
-
-            if (!send_ok && can_use_4g)
-            {
-                tried_4g = 1;
-                if (eg_send_data(raw_data, raw_len) == 0)
-                {
-                    send_ok = 1;
-                    g_send_count_4g++;
-                    printf("[MAIN] Sent %d bytes via 4G (BD_FIRST fallback)\n", raw_len);
-                }
-                else
-                {
-                    eg_connected = 0;
-                    main_set_4g_available(0);
-                    printf("[MAIN] BD_FIRST 4G fallback failed\n");
-                }
-            }
-            break;
-        }
-        case SEND_PATH_AUTO:
-        case SEND_PATH_4G_FIRST:
-        default:
-            if (can_use_4g)
-            {
-                tried_4g = 1;
-                if (eg_send_data(raw_data, raw_len) == 0)
-                {
-                    send_ok = 1;
-                    g_send_count_4g++;
-                    printf("[MAIN] Sent %d bytes via 4G\n", raw_len);
-                }
-                else
-                {
-                    eg_connected = 0;
-                    main_set_4g_available(0);
-                    printf("[MAIN] 4G send failed\n");
-                }
-            }
-
-            if (!send_ok)
-            {
-                time_t now = time(NULL);
-
-                if (now - last_bd_send_time >= BD_SEND_INTERVAL)
-                {
-                    tried_bd = 1;
-                    if (bd_task_start(&bd_task, raw_data, raw_len) == 0)
-                    {
-                        memcpy(bd_task_commit_offsets, pending_offsets, sizeof(bd_task_commit_offsets));
-
-                        int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
-
-                        if (bd_ret == BD_TASK_DONE)
-                        {
-                            send_ok = 1;
-                            g_send_count_bd++;
-                            printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
-                        }
-                        else if (bd_ret == BD_TASK_PENDING)
-                        {
-                            printf("[MAIN] BD task pending, offsets not advanced yet\n");
-                            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
-                            continue;
-                        }
-                        else
-                        {
-                            printf("[MAIN] BD task first segment failed\n");
-                        }
-                    }
-                    else
-                    {
-                        printf("[MAIN] BD task start failed\n");
-                    }
-                }
-                else
-                {
-                    printf("[MAIN] BD fallback interval not reached (%ld sec left)\n",
-                           BD_SEND_INTERVAL - (now - last_bd_send_time));
+                    state = MAIN_ST_BD_WAIT;
                 }
             }
             break;
         }
 
-        if (send_ok)
-        {
-            memcpy(offsets, pending_offsets, sizeof(offsets));
-            for (int i = 0; i < MAIN_PATH_COUNT; i++)
-            {
-                compact_log_file(paths[i], &offsets[i], 10);
-            }
-            save_offsets(OFFSET_FILE_MAIN, offsets, 4);
-            continue;
-        }
-        else
-        {
-            g_send_fail_count++;
-            printf("[MAIN] Send failed, offsets not advanced (tried_4g=%d, tried_bd=%d)\n",
-                   tried_4g, tried_bd);
-        }
+        case MAIN_ST_BD_WAIT:
+            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+            state = MAIN_ST_TRY_BD;
+            break;
 
-        interruptible_sleep(10);
+        case MAIN_ST_POWER_DOWN:
+            printf("[MAIN] Power down and wait for new data\n");
+
+            main_all_power_down(&eg_initialized,
+                                &eg_connected,
+                                &eg_power_generation_seen);
+
+            bd_fallback_active = 0;
+            bd_fail_count = 0;
+            eg_ready_fail_count = 0;
+            next_4g_try_time = 0;
+
+            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+            usleep(1000 * 1000);
+
+            state = MAIN_ST_IDLE;
+            break;
+        }
     }
 
     main_all_power_down(&eg_initialized,

@@ -20,11 +20,21 @@
 #include "llcc68.h"
 #include "../inc/bluetooth.h"
 
-#define OFFSET_FILE_MAIN   "/home/cat/send_offset.dat"
+#define OFFSET_FILE_MAIN "/home/cat/send_offset.dat"
 #define OFFSET_FILE_LORA "/home/cat/send_offset_lora.dat"
 #define OFFSET_FILE_LORA_RECV "/home/cat/send_offset_lora_recv.dat"
 #define MAIN_PATH_COUNT 4
 #define LORA_MAX_HEX_LEN 256
+#define BD_FAIL_MAX 3
+#define MAIN_4G_COOLDOWN_SEC 60
+typedef enum
+{
+    MAIN_ST_IDLE = 0,
+    MAIN_ST_TRY_4G,
+    MAIN_ST_TRY_BD,
+    MAIN_ST_BD_WAIT,
+    MAIN_ST_POWER_DOWN
+} main_send_state_t;
 
 void handle_signal(int sig);
 // 可被 stop_flag 中断的 sleep，返回 0 表示正常完成，-1 表示被中断
