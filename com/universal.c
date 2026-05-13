@@ -12,13 +12,17 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <string.h>
-#define FRAME_TIMEOUT_MS 10
+#define FRAME_TIMEOUT_MS 20
 #define BUFFER_SIZE 1024
-
-
-
-
-
+#define LOG_COMPACT_MAX_LINE 1024
+#define LOG_COMPACT_MAX_KEEP_FRAMES 32
+typedef struct
+{
+    uint32_t id;
+    int valid;
+} kept_frame_t;
+static pthread_mutex_t g_log_frame_id_lock = PTHREAD_MUTEX_INITIALIZER;
+static uint32_t g_log_frame_id = 0;
 uint16_t crc16(const uint8_t *data, uint16_t len)
 {
     uint16_t crc = 0xFFFF;
@@ -81,7 +85,14 @@ int parse_log_line(const char *line, unsigned char *out_data, int max_len)
     data_start++; // 跳过 ']'
     while (*data_start == ' ')
         data_start++;
-
+    while (strncmp(data_start, "F=", 2) == 0 ||
+           strncmp(data_start, "P=", 2) == 0)
+    {
+        while (*data_start && *data_start != ' ')
+            data_start++;
+        while (*data_start == ' ')
+            data_start++;
+    }
     // 解析十六进制字节
     int count = 0;
     char *p = data_start;
@@ -150,7 +161,10 @@ static void submit_frame(serial_state_t *state, frame_processor_ctx_t *ctx, cons
         return;
     }
     int offset = 0;
-
+    uint32_t frame_id = log_next_frame_id();
+    int part_count = (state->frame_len + (int)sizeof(((fifo_message_t *)0)->data) - 1) /
+                     (int)sizeof(((fifo_message_t *)0)->data);
+    int part_index = 0;
     while (offset < state->frame_len)
     {
         fifo_message_t msg;
@@ -164,8 +178,10 @@ static void submit_frame(serial_state_t *state, frame_processor_ctx_t *ctx, cons
 
         msg.type = state->data_type;
         msg.len = chunk_len;
+        msg.frame_id = frame_id;
+        msg.part_index = part_index++;
+        msg.part_count = part_count;
         memcpy(msg.data, state->frame_buf + offset, chunk_len);
-
         pthread_mutex_lock(ctx->fifo_lock);
         // memcpy(msg.data, state->frame_buf, copy_len);
         if (kfifo_left(ctx->fifo) < sizeof(fifo_message_t))
@@ -438,33 +454,7 @@ int save_offsets(const char *path, const off_t *offsets, int count)
     return 0;
 }
 // 将原始数据打包成北斗协议并发送
-int bd_send_packet(const unsigned char *data, int len)
-{
-    char hex_buf[BD_MSG_LEN + 64];
-    char msg[512];
-    // 将原始数据转换为十六进制字符串（无逗号分隔）
-    char *p = hex_buf;
-    for (int i = 0; i < len && (p - hex_buf) < BD_MSG_LEN - 2; i++)
-    {
-        p += sprintf(p, "%02X", data[i]);
-    }
-    // 构造报文
-    snprintf(msg, sizeof(msg), "$CCTCQ,4314513,2,1,2,%s,0*", hex_buf);
-    unsigned char cs = calc_checksum(msg);
-    size_t msg_len = strlen(msg);
-    snprintf(msg + msg_len, sizeof(msg) - msg_len, "%02X\r\n", cs);
-    int send_len = strlen(msg);
-    printf("[BD TX] %s", msg);
-    int ret = data_send((unsigned char *)msg, send_len, BD_DEV);
 
-    if (ret == send_len)
-    {
-        return 0;
-    }
-
-    printf("[BD] send failed or partial, ret=%d expected=%d\n", ret, send_len);
-    return -1;
-}
 /**
  * 从多个日志文件中读取新行，解析原始数据并打包成十六进制字符串（以逗号分隔）。
  * 每个线程独立维护自己的文件偏移量，互不干扰。
@@ -546,4 +536,150 @@ int pack_data_from_files(const char **paths, off_t *offsets, int file_count,
 
     return 0;
 }
+uint32_t log_next_frame_id(void)
+{
+    uint32_t id;
 
+    pthread_mutex_lock(&g_log_frame_id_lock);
+    id = ++g_log_frame_id;
+    if (g_log_frame_id == 0)
+    {
+        g_log_frame_id = 1;
+        id = 1;
+    }
+    pthread_mutex_unlock(&g_log_frame_id_lock);
+
+    return id;
+}
+static int parse_log_frame_id(const char *line, uint32_t *frame_id)
+{
+    const char *p;
+
+    if (!line || !frame_id)
+        return 0;
+
+    p = strstr(line, "] F=");
+    if (!p)
+        return 0;
+
+    p += 4;
+
+    if (sscanf(p, "%u", frame_id) != 1)
+        return 0;
+
+    return 1;
+}
+
+static int frame_id_is_kept(kept_frame_t *frames, int count, uint32_t frame_id)
+{
+    for (int i = 0; i < count; i++)
+    {
+        if (frames[i].valid && frames[i].id == frame_id)
+            return 1;
+    }
+
+    return 0;
+}
+
+static void keep_frame_id(kept_frame_t *frames, int keep_frames, uint32_t frame_id)
+{
+    for (int i = 0; i < keep_frames; i++)
+    {
+        if (frames[i].valid && frames[i].id == frame_id)
+            return;
+    }
+
+    for (int i = 0; i < keep_frames - 1; i++)
+        frames[i] = frames[i + 1];
+
+    frames[keep_frames - 1].id = frame_id;
+    frames[keep_frames - 1].valid = 1;
+}
+
+int compact_log_file(const char *path, off_t *offset, int keep_frames)
+{
+    FILE *fp = NULL;
+    FILE *out = NULL;
+    char tmp_path[256];
+    char line[LOG_COMPACT_MAX_LINE];
+    kept_frame_t kept[LOG_COMPACT_MAX_KEEP_FRAMES] = {0};
+    off_t sent_end;
+    off_t new_offset = 0;
+    uint32_t legacy_frame_id = 0;
+
+    if (!path || !offset || *offset <= 0)
+        return 0;
+
+    if (keep_frames <= 0)
+        return 0;
+
+    if (keep_frames > LOG_COMPACT_MAX_KEEP_FRAMES)
+        keep_frames = LOG_COMPACT_MAX_KEEP_FRAMES;
+
+    fp = fopen(path, "r");
+    if (!fp)
+        return 0;
+
+    sent_end = *offset;
+
+    while (ftello(fp) < sent_end && fgets(line, sizeof(line), fp))
+    {
+        uint32_t frame_id;
+
+        if (!parse_log_frame_id(line, &frame_id))
+        {
+            frame_id = ++legacy_frame_id;
+        }
+
+        keep_frame_id(kept, keep_frames, frame_id);
+    }
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+
+    out = fopen(tmp_path, "w");
+    if (!out)
+    {
+        fclose(fp);
+        return -1;
+    }
+
+    rewind(fp);
+    legacy_frame_id = 0;
+
+    while (ftello(fp) < sent_end && fgets(line, sizeof(line), fp))
+    {
+        uint32_t frame_id;
+
+        if (!parse_log_frame_id(line, &frame_id))
+        {
+            frame_id = ++legacy_frame_id;
+        }
+
+        if (frame_id_is_kept(kept, keep_frames, frame_id))
+        {
+            fputs(line, out);
+            new_offset += strlen(line);
+        }
+    }
+
+    fseeko(fp, sent_end, SEEK_SET);
+
+    while (fgets(line, sizeof(line), fp))
+    {
+        fputs(line, out);
+    }
+
+    fflush(out);
+    fsync(fileno(out));
+    fclose(out);
+    fclose(fp);
+
+    if (rename(tmp_path, path) != 0)
+    {
+        remove(tmp_path);
+        return -1;
+    }
+
+    *offset = new_offset;
+    return 0;
+}

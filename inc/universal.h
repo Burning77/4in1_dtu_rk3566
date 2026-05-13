@@ -25,8 +25,9 @@
 #define EG_DATA 4
 #define LORA_DATA 5
 #define FIFO_SIZE (16 * 1024) // 必须是2的幂次方
-#define BD_MSG_LEN 229
-#define EG_MSG_LEN 229
+
+#define EG_MSG_LEN 2048
+#define EG_MAX_HEX_LEN (EG_MSG_LEN * 2 + 256)
 #define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define LORA_MESH_GATEWAY 0x01
 #define LORA_MESH_NODE 0x00
@@ -35,9 +36,12 @@
 #define DEBUG
 typedef struct
 {
-    int type;                // RS485_DATA 或 RS232_DATA
-    unsigned int len;        // 数据长度
-    unsigned char data[256]; // 原始数据
+    int type;                  // RS485_DATA 或 RS232_DATA
+    unsigned int len;          // 数据长度
+    unsigned char data[256];   // 原始数据
+    unsigned int frame_id;     // 原始帧ID
+    unsigned short part_index; // 当前分片序号
+    unsigned short part_count; // 总分片数
 } fifo_message_t;
 
 // 前向声明
@@ -82,5 +86,6 @@ int load_offsets(const char *path, off_t *offsets, int count);
 int save_offsets(const char *path, const off_t *offsets, int count);
 uint16_t crc16(const uint8_t *data, uint16_t len);
 int push_lora_to_fifo(frame_processor_ctx_t *ctx, const uint8_t *data, uint8_t len);
-
+uint32_t log_next_frame_id(void);
+int compact_log_file(const char *path, off_t *offset, int keep_frames);
 #endif

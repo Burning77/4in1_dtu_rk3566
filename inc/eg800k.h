@@ -15,7 +15,6 @@ typedef enum
 int eg_send_cmd(const char *cmd, const char *expected_resp, int timeout_sec);
 int eg_init(void);
 int eg_send_data(const unsigned char *data, int len);
-int bd_send_packet(const unsigned char *data, int len);
 int eg_is_network_available(void);
 int eg_reinit_pdp(void);
 int eg_connect(void);

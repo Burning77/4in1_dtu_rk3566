@@ -4,8 +4,9 @@
 #include "../inc/bluetooth.h"
 #include <sys/ioctl.h>
 #include "../inc/power.h"
+#include "../inc/bd3.h"
 #define DEBUG
-#define MAIN_PATH_COUNT 4
+
 #define MAIN_IDLE_WAKE_POLL_SEC 60
 #define MAIN_SEND_RETRY_WAIT_SEC 10
 extern struct kfifo data_fifo;
@@ -224,9 +225,9 @@ static int debug_bt_bd_enqueue(const uint8_t *data, int len)
 
     /*
      * bd_send_packet() 会把原始数据转成十六进制字符串。
-     * BD_MSG_LEN 是十六进制最大长度，所以原始数据不能太长。
+     * BD_MAX_RAW_LEN 是十六进制最大长度，所以原始数据不能太长。
      */
-    if ((len * 2) > (BD_MSG_LEN - 2))
+    if ((len * 2) > (BD_MAX_RAW_LEN - 2))
     {
         printf("[DEBUG BT] BD payload too long: raw_len=%d\n", len);
         return -2;
@@ -687,7 +688,34 @@ void *receive_thread(void *arg)
 
     return NULL;
 }
+void *serial_send_thread(void *arg)
+{
+    const char *test = "Hello from rs232!\r\n";
+    // 注意：不再从此线程发送 EG 命令，避免与 main_send_thread 的 eg_init() 冲突
+    // while (!stop_flag)
+    // {
+    //     if (interruptible_sleep(SEND_INTERVAL) < 0)
+    //         break;
 
+    //     printf("[SEND] Sending command...\n");
+    //     int resualt = data_send(test, strlen(test), RS232_DEV);
+    //     int ret = data_send(CMD_STRING, strlen(CMD_STRING), RS485_DEV);
+    //     int res_bd = data_send(BD_CARD, strlen(BD_CARD), BD_DEV);
+    //     if (resualt < 0)
+    //     {
+    //         perror("rs232_send");
+    //     }
+    //     if (ret < 0)
+    //     {
+    //         perror("rs485_send");
+    //     }
+    //     if (res_bd < 0)
+    //     {
+    //         perror("bd_send");
+    //     }
+    // }
+    return NULL;
+}
 void *read_rtc_thread(void *arg)
 {
     int year, month, day, hour, min, sec;
@@ -712,7 +740,6 @@ void *read_rtc_thread(void *arg)
 void *write_file_thread(void *arg)
 {
     fifo_message_t msg;
-    FILE *fp_485 = NULL, *fp_232 = NULL, *fp_bd = NULL, *fp_lora = NULL, *fp_bt = NULL;
     char log_line[1024];
 
     while (!stop_flag)
@@ -745,54 +772,51 @@ void *write_file_thread(void *arg)
             continue; // 数据不完整，跳过
 
         // 选择文件 - 根据数据类型选择对应的日志文件
-        FILE **fp = NULL;
         const char *path = NULL;
         switch (msg.type)
         {
         case RS485_DATA:
-            fp = &fp_485;
             path = RS485_LOG_PATH;
             break;
         case RS232_DATA:
-            fp = &fp_232;
             path = RS232_LOG_PATH;
             break;
         case BD_DATA:
-            fp = &fp_bd;
             path = BD_LOG_PATH;
             break;
         case LORA_DATA:
-            fp = &fp_lora;
             path = LORA_LOG_PATH;
             break;
 #ifdef DEBUG
         case BT_DATA:
-            fp = &fp_bt;
             path = BT_LOG_PATH;
             break;
 #endif
         default:
             printf("[WARN] Unknown data type: %d, skipping\n", msg.type);
-            continue; // 跳过未知类型
+            continue;
         }
-
-        if (*fp == NULL)
-        {
-            *fp = fopen(path, "a");
-            if (!*fp)
-            {
-                perror("fopen");
-                continue;
-            }
-        }
-
         // 构造时间戳行
         time_t now = time(NULL);
         struct tm *tm_info = localtime(&now);
+        if (msg.frame_id == 0)
+        {
+            msg.frame_id = log_next_frame_id();
+            msg.part_index = 0;
+            msg.part_count = 1;
+        }
+
         int pos = snprintf(log_line, sizeof(log_line),
-                           "[%04d-%02d-%02d %02d:%02d:%02d] ",
-                           tm_info->tm_year + 1900, tm_info->tm_mon + 1, tm_info->tm_mday,
-                           tm_info->tm_hour, tm_info->tm_min, tm_info->tm_sec);
+                           "[%04d-%02d-%02d %02d:%02d:%02d] F=%u P=%u/%u ",
+                           tm_info->tm_year + 1900,
+                           tm_info->tm_mon + 1,
+                           tm_info->tm_mday,
+                           tm_info->tm_hour,
+                           tm_info->tm_min,
+                           tm_info->tm_sec,
+                           msg.frame_id,
+                           msg.part_index,
+                           msg.part_count);
         for (int i = 0; i < msg.len && pos < (int)sizeof(log_line) - 5; i++)
         {
             pos += snprintf(log_line + pos, sizeof(log_line) - pos, "%02X ", msg.data[i]);
@@ -800,29 +824,34 @@ void *write_file_thread(void *arg)
         log_line[pos] = '\n';
         log_line[pos + 1] = '\0';
 
-        fputs(log_line, *fp);
-        fflush(*fp); // 可改为批量 flush
+        FILE *fp = fopen(path, "a");
+        if (!fp)
+        {
+            perror("fopen");
+            continue;
+        }
+
+        if (fputs(log_line, fp) == EOF)
+        {
+            perror("fputs");
+            fclose(fp);
+            continue;
+        }
+
+        fflush(fp);
+        fsync(fileno(fp));
+        fclose(fp);
+
         if (msg.type == RS485_DATA || msg.type == BT_DATA)
         {
             notify_data_wakeup(msg.type == RS485_DATA ? "RS485" : "BT");
         }
     }
-
-    if (fp_485)
-        fclose(fp_485);
-    if (fp_232)
-        fclose(fp_232);
-    if (fp_bd)
-        fclose(fp_bd);
-    if (fp_lora)
-        fclose(fp_lora);
-    if (fp_bt)
-        fclose(fp_bt);
     return NULL;
 }
 // void *bd_send_thread(void *arg)
 // {
-//     char hex_buf[BD_MSG_LEN];
+//     char hex_buf[BD_MAX_RAW_LEN];
 //     char msg[512];
 //     const char *paths[] = {RS485_LOG_PATH, RS232_LOG_PATH};
 //     off_t offsets[2] = {0, 0};
@@ -832,7 +861,7 @@ void *write_file_thread(void *arg)
 //     // 等待日志文件被创建（最多等待30秒）
 //     while (!stop_flag)
 //     {
-//         if (pack_data_from_files(paths, offsets, 2, BD_MSG_LEN,
+//         if (pack_data_from_files(paths, offsets, 2, BD_MAX_RAW_LEN,
 //                                  hex_buf, &hex_len, &entry_count) == 0)
 //         {
 
@@ -1211,8 +1240,8 @@ void *main_send_thread(void *arg)
     const char *paths[MAIN_PATH_COUNT] = {RS485_LOG_PATH, RS232_LOG_PATH, LORA_LOG_PATH, BT_LOG_PATH};
     off_t offsets[MAIN_PATH_COUNT] = {0, 0, 0, 0};
     int hex_len, entry_count;
-    char hex_buf[EG_MSG_LEN + 64];
-
+    char hex_buf[EG_MAX_HEX_LEN];
+    unsigned char raw_data[EG_MSG_LEN];
     time_t last_bd_send_time = 0;
     const int BD_SEND_INTERVAL = 60;
 
@@ -1227,12 +1256,48 @@ void *main_send_thread(void *arg)
     pthread_mutex_lock(&g_data_wakeup_mutex);
     wakeup_seq_seen = g_data_wakeup_seq;
     pthread_mutex_unlock(&g_data_wakeup_mutex);
+    bd_segment_task_t bd_task;
+    off_t bd_task_commit_offsets[MAIN_PATH_COUNT];
+    off_t pending_offsets[MAIN_PATH_COUNT];
+    bd_task_clear(&bd_task);
+    memset(bd_task_commit_offsets, 0, sizeof(bd_task_commit_offsets));
     while (!stop_flag)
     {
-        off_t pending_offsets[MAIN_PATH_COUNT];
-        memcpy(pending_offsets, offsets, sizeof(offsets));
+        if (bd_task.active)
+        {
+            main_ensure_bd_ready();
 
-        if (pack_data_from_files(paths, pending_offsets, MAIN_PATH_COUNT, EG_MSG_LEN,
+            int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
+
+            if (bd_ret == BD_TASK_DONE)
+            {
+                memcpy(offsets, bd_task_commit_offsets, sizeof(offsets));
+
+                for (int i = 0; i < MAIN_PATH_COUNT; i++)
+                    compact_log_file(paths[i], &offsets[i], 10);
+
+                save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
+
+                g_send_count_bd++;
+                bd_task_clear(&bd_task);
+
+                printf("[MAIN] BD task complete, offsets advanced\n");
+                continue;
+            }
+
+            if (bd_ret == BD_TASK_FAILED)
+            {
+                g_send_fail_count++;
+                printf("[MAIN] BD task failed, offsets not advanced\n");
+            }
+
+            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+            usleep(200 * 1000);
+            continue;
+        }
+
+        memcpy(pending_offsets, offsets, sizeof(offsets));
+        if (pack_data_from_files(paths, pending_offsets, MAIN_PATH_COUNT, EG_MAX_HEX_LEN,
                                  hex_buf, &hex_len, &entry_count) != 0)
         {
             printf("[MAIN] pack_data_from_files failed\n");
@@ -1249,10 +1314,10 @@ void *main_send_thread(void *arg)
             eg_ready_fail_count = 0;
             next_4g_try_time = 0;
             main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+            usleep(200 * 1000);
             continue;
         }
 
-        unsigned char raw_data[256];
         int raw_len = hex_to_bytes(hex_buf, raw_data, sizeof(raw_data));
         if (raw_len <= 0)
         {
@@ -1365,16 +1430,32 @@ void *main_send_thread(void *arg)
             if (now - last_bd_send_time >= BD_SEND_INTERVAL)
             {
                 tried_bd = 1;
-                if (bd_send_packet(raw_data, raw_len) == 0)
+                if (bd_task_start(&bd_task, raw_data, raw_len) == 0)
                 {
-                    send_ok = 1;
-                    last_bd_send_time = now;
-                    g_send_count_bd++;
-                    printf("[MAIN] Sent %d bytes via BD (BD_ONLY)\n", raw_len);
+                    memcpy(bd_task_commit_offsets, pending_offsets, sizeof(bd_task_commit_offsets));
+
+                    int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
+
+                    if (bd_ret == BD_TASK_DONE)
+                    {
+                        send_ok = 1;
+                        g_send_count_bd++;
+                        printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
+                    }
+                    else if (bd_ret == BD_TASK_PENDING)
+                    {
+                        printf("[MAIN] BD task pending, offsets not advanced yet\n");
+                        main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+                        continue;
+                    }
+                    else
+                    {
+                        printf("[MAIN] BD task first segment failed\n");
+                    }
                 }
                 else
                 {
-                    printf("[MAIN] BD_ONLY send failed\n");
+                    printf("[MAIN] BD task start failed\n");
                 }
             }
             else
@@ -1392,16 +1473,32 @@ void *main_send_thread(void *arg)
             if (now - last_bd_send_time >= BD_SEND_INTERVAL)
             {
                 tried_bd = 1;
-                if (bd_send_packet(raw_data, raw_len) == 0)
+                if (bd_task_start(&bd_task, raw_data, raw_len) == 0)
                 {
-                    send_ok = 1;
-                    last_bd_send_time = now;
-                    g_send_count_bd++;
-                    printf("[MAIN] Sent %d bytes via BD (BD_FIRST)\n", raw_len);
+                    memcpy(bd_task_commit_offsets, pending_offsets, sizeof(bd_task_commit_offsets));
+
+                    int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
+
+                    if (bd_ret == BD_TASK_DONE)
+                    {
+                        send_ok = 1;
+                        g_send_count_bd++;
+                        printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
+                    }
+                    else if (bd_ret == BD_TASK_PENDING)
+                    {
+                        printf("[MAIN] BD task pending, offsets not advanced yet\n");
+                        main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+                        continue;
+                    }
+                    else
+                    {
+                        printf("[MAIN] BD task first segment failed\n");
+                    }
                 }
                 else
                 {
-                    printf("[MAIN] BD_FIRST BD send failed\n");
+                    printf("[MAIN] BD task start failed\n");
                 }
             }
 
@@ -1450,16 +1547,32 @@ void *main_send_thread(void *arg)
                 if (now - last_bd_send_time >= BD_SEND_INTERVAL)
                 {
                     tried_bd = 1;
-                    if (bd_send_packet(raw_data, raw_len) == 0)
+                    if (bd_task_start(&bd_task, raw_data, raw_len) == 0)
                     {
-                        send_ok = 1;
-                        last_bd_send_time = now;
-                        g_send_count_bd++;
-                        printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
+                        memcpy(bd_task_commit_offsets, pending_offsets, sizeof(bd_task_commit_offsets));
+
+                        int bd_ret = bd_task_send_one_segment(&bd_task, &last_bd_send_time);
+
+                        if (bd_ret == BD_TASK_DONE)
+                        {
+                            send_ok = 1;
+                            g_send_count_bd++;
+                            printf("[MAIN] Sent %d bytes via BD fallback\n", raw_len);
+                        }
+                        else if (bd_ret == BD_TASK_PENDING)
+                        {
+                            printf("[MAIN] BD task pending, offsets not advanced yet\n");
+                            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
+                            continue;
+                        }
+                        else
+                        {
+                            printf("[MAIN] BD task first segment failed\n");
+                        }
                     }
                     else
                     {
-                        printf("[MAIN] BD fallback failed\n");
+                        printf("[MAIN] BD task start failed\n");
                     }
                 }
                 else
@@ -1474,6 +1587,10 @@ void *main_send_thread(void *arg)
         if (send_ok)
         {
             memcpy(offsets, pending_offsets, sizeof(offsets));
+            for (int i = 0; i < MAIN_PATH_COUNT; i++)
+            {
+                compact_log_file(paths[i], &offsets[i], 10);
+            }
             save_offsets(OFFSET_FILE_MAIN, offsets, 4);
             continue;
         }
