@@ -12,6 +12,7 @@
 #include <errno.h>
 #include <sys/time.h>
 #include <string.h>
+
 #define FRAME_TIMEOUT_MS 10
 #define BUFFER_SIZE 1024
 #define LOG_COMPACT_MAX_LINE 1024
@@ -682,4 +683,11 @@ int compact_log_file(const char *path, off_t *offset, int keep_frames)
 
     *offset = new_offset;
     return 0;
+}
+
+time_t monotonic_sec(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
 }

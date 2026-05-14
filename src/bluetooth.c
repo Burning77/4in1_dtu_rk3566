@@ -223,7 +223,7 @@ int bt_send_text(const char *text)
     int ret = data_send((unsigned char *)text, strlen(text), BT_DEV);
     if (ret > 0)
     {
-        printf("[BT] Sent: %s", text);
+        // printf("[BT] Sent: %s", text);
         return 0;
     }
     return -1;

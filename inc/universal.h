@@ -88,4 +88,5 @@ uint16_t crc16(const uint8_t *data, uint16_t len);
 int push_lora_to_fifo(frame_processor_ctx_t *ctx, const uint8_t *data, uint8_t len);
 uint32_t log_next_frame_id(void);
 int compact_log_file(const char *path, off_t *offset, int keep_frames);
+time_t monotonic_sec(void);
 #endif

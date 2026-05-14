@@ -130,6 +130,7 @@ int eg_init(void)
     // 1. AT 同步
     if (eg_send_cmd("AT\r\n", "OK", 2) != 0)
         return -1;
+    eg_send_cmd("ATE0\r\n", "OK", 3);
     if (eg_send_cmd("ATI\r\n", "Revision", 8) != 0)
     {
         printf("[EG] Module not responding correctly to ATI\n");
@@ -179,11 +180,13 @@ int eg_init(void)
 int eg_send_data(const unsigned char *data, int len)
 {
     char cmd[32];
-    char buf[256] = {0};
+    char buf[512] = {0};
     int total = 0;
     fd_set fds;
     struct timeval tv, start, now;
-
+    unsigned char chunk[256];
+    char resp[128];
+    int resp_len = 0;
     // 清空接收缓冲区
     tcflush(eg_fd, TCIFLUSH);
 
@@ -245,44 +248,51 @@ int eg_send_data(const unsigned char *data, int len)
         gettimeofday(&now, NULL);
         long elapsed = (now.tv_sec - start.tv_sec) * 1000 +
                        (now.tv_usec - start.tv_usec) / 1000;
-        if (elapsed >= 5000)
+
+        if (elapsed >= 10000)
         {
-            printf("[EG] SEND OK timeout, received so far: [%s]\n", buf);
-            // 即使超时，如果服务器收到了数据，也算成功
-            // 检查是否有部分成功的迹象
+            resp[resp_len] = '\0';
+            printf("[EG] SEND OK timeout, tail response: [%s]\n", resp);
             return -1;
         }
 
         FD_ZERO(&fds);
         FD_SET(eg_fd, &fds);
         tv.tv_sec = 0;
-        tv.tv_usec = 500000; // 500ms
+        tv.tv_usec = 500000;
 
         int ret = select(eg_fd + 1, &fds, NULL, NULL, &tv);
         if (ret <= 0)
             continue;
 
-        int n = data_recv(buf + total, sizeof(buf) - 1 - total, EG_DEV);
-        if (n > 0)
+        int n = data_recv(chunk, sizeof(chunk), EG_DEV);
+        if (n <= 0)
+            continue;
+
+        for (int i = 0; i < n; i++)
         {
-            total += n;
-            buf[total] = '\0';
-            // 只打印非空响应
-            if (n > 0 && buf[total - n] != '\0')
+            if (resp_len >= (int)sizeof(resp) - 1)
             {
-                printf("[EG] Recv (%d bytes): [%s]\n", n, buf + total - n);
+                memmove(resp, resp + 1, resp_len - 1);
+                resp_len--;
             }
 
-            if (strstr(buf, "SEND OK"))
-            {
-                printf("[EG] Data sent successfully (%d bytes)\n", len);
-                return 0;
-            }
-            if (strstr(buf, "ERROR") || strstr(buf, "SEND FAIL") || strstr(buf, "CLOSED"))
-            {
-                printf("[EG] Send failed: %s\n", buf);
-                return -1;
-            }
+            resp[resp_len++] = (char)chunk[i];
+            resp[resp_len] = '\0';
+        }
+
+        if (strstr(resp, "SEND OK"))
+        {
+            printf("[EG] Data sent successfully (%d bytes)\n", len);
+            return 0;
+        }
+
+        if (strstr(resp, "SEND FAIL") ||
+            strstr(resp, "ERROR") ||
+            strstr(resp, "CLOSED"))
+        {
+            printf("[EG] Send failed, tail response: [%s]\n", resp);
+            return -1;
         }
     }
     return -1; // stop_flag 中断

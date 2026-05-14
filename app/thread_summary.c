@@ -56,6 +56,103 @@ extern int bt_fd;
 extern int eg_fd;
 extern int watchdog_fd;
 extern loRa_Para_t my_lora_config;
+static int offsets_reached(const off_t *offsets, const off_t *end_offsets)
+{
+    for (int i = 0; i < MAIN_PATH_COUNT; i++)
+    {
+        if (offsets[i] < end_offsets[i])
+            return 0;
+    }
+
+    return 1;
+}
+static int main_pack_pending_until(const char **paths,
+                                   const off_t *offsets,
+                                   const off_t *end_offsets,
+                                   off_t *pending_offsets,
+                                   int max_hex_len,
+                                   char *hex_buf,
+                                   unsigned char *raw_buf,
+                                   int raw_buf_size,
+                                   int *raw_len,
+                                   int *entry_count)
+{
+    int hex_len = 0;
+
+    memcpy(pending_offsets, offsets, sizeof(off_t) * MAIN_PATH_COUNT);
+
+    hex_buf[0] = '\0';
+    *raw_len = 0;
+    *entry_count = 0;
+
+    for (int i = 0; i < MAIN_PATH_COUNT; i++)
+    {
+        FILE *fp = fopen(paths[i], "r");
+        if (!fp)
+            continue;
+
+        if (pending_offsets[i] >= end_offsets[i])
+        {
+            fclose(fp);
+            continue;
+        }
+
+        if (fseeko(fp, pending_offsets[i], SEEK_SET) != 0)
+        {
+            fclose(fp);
+            return -1;
+        }
+
+        char line[1024];
+
+        while (ftello(fp) < end_offsets[i] && fgets(line, sizeof(line), fp))
+        {
+            off_t line_end = ftello(fp);
+
+            if (line_end > end_offsets[i])
+                break;
+
+            unsigned char raw[256];
+            int line_raw_len = parse_log_line(line, raw, sizeof(raw));
+
+            if (line_raw_len < 2)
+            {
+                pending_offsets[i] = line_end;
+                continue;
+            }
+
+            int comma_len = (*entry_count > 0) ? 1 : 0;
+            int need_hex = line_raw_len * 2;
+
+            if (hex_len + comma_len + need_hex > max_hex_len)
+                break;
+
+            if (*entry_count > 0)
+                hex_buf[hex_len++] = ',';
+
+            for (int j = 0; j < line_raw_len; j++)
+            {
+                snprintf(hex_buf + hex_len,
+                         max_hex_len + 1 - hex_len,
+                         "%02X",
+                         raw[j]);
+                hex_len += 2;
+            }
+
+            hex_buf[hex_len] = '\0';
+            (*entry_count)++;
+            pending_offsets[i] = line_end;
+        }
+
+        fclose(fp);
+    }
+
+    if (*entry_count == 0)
+        return 0;
+
+    *raw_len = hex_to_bytes(hex_buf, raw_buf, raw_buf_size);
+    return (*raw_len > 0) ? 0 : -1;
+}
 static int main_pack_pending(const char **paths,
                              const off_t *offsets,
                              off_t *pending_offsets,
@@ -1286,7 +1383,7 @@ void *main_send_thread(void *arg)
     int bd_entry_count = 0;
     int bd_raw_len = 0;
 
-    time_t last_bd_send_time = 0;
+    time_t next_bd_send_time = 0;
     time_t next_4g_try_time = 0;
 
     int eg_initialized = 0;
@@ -1306,11 +1403,15 @@ void *main_send_thread(void *arg)
     pthread_mutex_lock(&g_data_wakeup_mutex);
     wakeup_seq_seen = g_data_wakeup_seq;
     pthread_mutex_unlock(&g_data_wakeup_mutex);
+    struct timespec ts;
+    off_t bd_batch_end_offsets[MAIN_PATH_COUNT] = {0};
+    int bd_batch_active = 0;
     while (!stop_flag)
     {
         switch (state)
         {
         case MAIN_ST_IDLE:
+            usleep(300 * 1000);
             if (main_pack_pending(paths, offsets, pending_offsets,
                                   EG_MAX_HEX_LEN, hex_buf,
                                   raw_data, sizeof(raw_data),
@@ -1378,7 +1479,11 @@ void *main_send_thread(void *arg)
                     state = MAIN_ST_POWER_DOWN;
                     break;
                 }
-
+                if (send_path != SEND_PATH_4G_ONLY && !bd_batch_active)
+                {
+                    memcpy(bd_batch_end_offsets, pending_offsets, sizeof(bd_batch_end_offsets));
+                    bd_batch_active = 1;
+                }
                 state = (send_path == SEND_PATH_4G_ONLY) ? MAIN_ST_IDLE : MAIN_ST_TRY_BD;
                 break;
             }
@@ -1404,7 +1509,11 @@ void *main_send_thread(void *arg)
                 eg_connected = 0;
                 main_set_4g_available(0);
                 printf("[MAIN] 4G send failed\n");
-
+                if (send_path != SEND_PATH_4G_ONLY && !bd_batch_active)
+                {
+                    memcpy(bd_batch_end_offsets, pending_offsets, sizeof(bd_batch_end_offsets));
+                    bd_batch_active = 1;
+                }
                 state = (send_path == SEND_PATH_4G_ONLY) ? MAIN_ST_IDLE : MAIN_ST_TRY_BD;
             }
             break;
@@ -1421,10 +1530,16 @@ void *main_send_thread(void *arg)
                                    &eg_connected,
                                    &eg_power_generation_seen);
             }
-            if (main_pack_pending(paths, offsets, pending_offsets,
-                                  BD_MAX_HEX_LEN, bd_hex_buf,
-                                  bd_raw_data, sizeof(bd_raw_data),
-                                  &bd_raw_len, &bd_entry_count) != 0)
+            if (main_pack_pending_until(paths,
+                                        offsets,
+                                        bd_batch_end_offsets,
+                                        pending_offsets,
+                                        BD_MAX_HEX_LEN,
+                                        bd_hex_buf,
+                                        bd_raw_data,
+                                        sizeof(bd_raw_data),
+                                        &bd_raw_len,
+                                        &bd_entry_count) != 0)
             {
                 printf("[MAIN] BD pack failed\n");
                 state = MAIN_ST_BD_WAIT;
@@ -1438,10 +1553,9 @@ void *main_send_thread(void *arg)
                 state = MAIN_ST_IDLE;
                 break;
             }
-
-            time_t now = time(NULL);
-            if (last_bd_send_time != 0 &&
-                now - last_bd_send_time < BD_SEND_INTERVAL_SEC)
+            time_t now = monotonic_sec();
+            if (next_bd_send_time != 0 &&
+                now < next_bd_send_time)
             {
                 state = MAIN_ST_BD_WAIT;
                 break;
@@ -1452,20 +1566,34 @@ void *main_send_thread(void *arg)
             if (bd_send_packet(bd_raw_data, bd_raw_len) == 0)
             {
                 memcpy(offsets, pending_offsets, sizeof(offsets));
-
-                for (int i = 0; i < MAIN_PATH_COUNT; i++)
-                    compact_log_file(paths[i], &offsets[i], 10);
-
                 save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
 
-                last_bd_send_time = time(NULL);
+                next_bd_send_time = monotonic_sec() + BD_SEND_INTERVAL_SEC;
                 bd_fail_count = 0;
                 g_send_count_bd++;
 
                 printf("[MAIN] Sent %d bytes via BD segment, offsets advanced\n",
                        bd_raw_len);
 
-                state = MAIN_ST_TRY_BD;
+                if (bd_batch_active && offsets_reached(offsets, bd_batch_end_offsets))
+                {
+                    for (int i = 0; i < MAIN_PATH_COUNT; i++)
+                        compact_log_file(paths[i], &offsets[i], 10);
+
+                    save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
+
+                    bd_batch_active = 0;
+                    bd_fallback_active = 0;
+                    next_4g_try_time = 0;
+
+                    printf("[MAIN] BD batch complete, return to 4G-first mode\n");
+
+                    state = MAIN_ST_IDLE;
+                }
+                else
+                {
+                    state = MAIN_ST_BD_WAIT;
+                }
             }
             else
             {
@@ -1488,11 +1616,28 @@ void *main_send_thread(void *arg)
         }
 
         case MAIN_ST_BD_WAIT:
-            main_wait_for_data_wakeup(&wakeup_seq_seen, MAIN_SEND_RETRY_WAIT_SEC);
-            state = MAIN_ST_TRY_BD;
+        {
+            time_t now = monotonic_sec();
+
+            if (next_bd_send_time == 0 || now >= next_bd_send_time)
+            {
+                state = MAIN_ST_TRY_BD;
+                break;
+            }
+
+            int wait_sec = (int)(next_bd_send_time - now);
+
+            if (wait_sec > MAIN_SEND_RETRY_WAIT_SEC)
+                wait_sec = MAIN_SEND_RETRY_WAIT_SEC;
+
+            main_wait_for_data_wakeup(&wakeup_seq_seen, wait_sec);
+
+            state = MAIN_ST_BD_WAIT;
             break;
+        }
 
         case MAIN_ST_POWER_DOWN:
+        {
             printf("[MAIN] Power down and wait for new data\n");
 
             main_all_power_down(&eg_initialized,
@@ -1509,6 +1654,7 @@ void *main_send_thread(void *arg)
 
             state = MAIN_ST_IDLE;
             break;
+        }
         }
     }
 
