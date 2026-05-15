@@ -4,6 +4,7 @@
 #include <gpiod.h>
 #include "../inc/power.h"
 #include "../inc/gpio.h"
+#include "../inc/bd3.h"
 extern struct gpiod_line *line_bd_en;
 extern struct gpiod_line *line_bd_pow;
 extern struct gpiod_line *line_bt_pow;
@@ -199,8 +200,9 @@ int main_ensure_bd_ready(void)
     if (!bd_power_is_on())
     {
         printf("[MAIN] Powering on BD module\n");
+        bd_status_reset();
         bd_power_on();
-        sleep(1);
+        sleep(14);
     }
 
     return 0;

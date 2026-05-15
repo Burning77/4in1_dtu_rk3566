@@ -268,7 +268,6 @@ int eg_send_data(const unsigned char *data, int len)
         int n = data_recv(chunk, sizeof(chunk), EG_DEV);
         if (n <= 0)
             continue;
-
         for (int i = 0; i < n; i++)
         {
             if (resp_len >= (int)sizeof(resp) - 1)

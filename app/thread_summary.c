@@ -778,6 +778,8 @@ void *receive_thread(void *arg)
         if (cur_bd_fd >= 0 && FD_ISSET(cur_bd_fd, &read_fds))
         {
             bd_read_len = data_recv(buf, sizeof(buf) - 1, BD_DEV);
+            if (bd_read_len > 0)
+                bd_status_feed(buf, bd_read_len);
         }
         process_serial_data(&bd_state, buf, bd_read_len, (ret == 0), &ctx);
 
@@ -1406,6 +1408,7 @@ void *main_send_thread(void *arg)
     struct timespec ts;
     off_t bd_batch_end_offsets[MAIN_PATH_COUNT] = {0};
     int bd_batch_active = 0;
+    time_t bd_power_hold_until = 0;
     while (!stop_flag)
     {
         switch (state)
@@ -1562,17 +1565,43 @@ void *main_send_thread(void *arg)
             }
 
             main_ensure_bd_ready();
+            if (bd_wait_ready_and_pwi(BD_READY_WAIT_SEC) != 0)
+            {
+                bd_fail_count++;
+                g_send_fail_count++;
 
-            if (bd_send_packet(bd_raw_data, bd_raw_len) == 0)
+                printf("[MAIN] BD not ready %d/%d\n",
+                       bd_fail_count, BD_FAIL_MAX);
+
+                state = (bd_fail_count >= BD_FAIL_MAX) ? MAIN_ST_POWER_DOWN : MAIN_ST_BD_WAIT;
+
+                break;
+            }
+            unsigned int tcq_seq_before = bd_get_tcq_seq();
+            if (bd_send_packet(bd_raw_data, bd_raw_len) != 0)
+            {
+                bd_fail_count++;
+                g_send_fail_count++;
+
+                printf("[MAIN] BD UART send failed %d/%d\n",
+                       bd_fail_count, BD_FAIL_MAX);
+
+                state = (bd_fail_count >= BD_FAIL_MAX) ? MAIN_ST_POWER_DOWN : MAIN_ST_BD_WAIT;
+
+                break;
+            }
+            if (bd_wait_tcq_success(tcq_seq_before, BD_TCQ_WAIT_SEC) == 0)
             {
                 memcpy(offsets, pending_offsets, sizeof(offsets));
                 save_offsets(OFFSET_FILE_MAIN, offsets, MAIN_PATH_COUNT);
 
                 next_bd_send_time = monotonic_sec() + BD_SEND_INTERVAL_SEC;
+                bd_power_hold_until = monotonic_sec() + BD_POWER_HOLD_SEC;
+
                 bd_fail_count = 0;
                 g_send_count_bd++;
 
-                printf("[MAIN] Sent %d bytes via BD segment, offsets advanced\n",
+                printf("[MAIN] Sent %d bytes via BD segment, TCQ ok, offsets advanced\n",
                        bd_raw_len);
 
                 if (bd_batch_active && offsets_reached(offsets, bd_batch_end_offsets))
@@ -1600,17 +1629,10 @@ void *main_send_thread(void *arg)
                 bd_fail_count++;
                 g_send_fail_count++;
 
-                printf("[MAIN] BD segment failed %d/%d\n",
+                printf("[MAIN] BD TCQ failed/timeout %d/%d, offsets not advanced\n",
                        bd_fail_count, BD_FAIL_MAX);
 
-                if (bd_fail_count >= BD_FAIL_MAX)
-                {
-                    state = MAIN_ST_POWER_DOWN;
-                }
-                else
-                {
-                    state = MAIN_ST_BD_WAIT;
-                }
+                state = (bd_fail_count >= BD_FAIL_MAX) ? MAIN_ST_POWER_DOWN : MAIN_ST_BD_WAIT;
             }
             break;
         }
@@ -1638,6 +1660,21 @@ void *main_send_thread(void *arg)
 
         case MAIN_ST_POWER_DOWN:
         {
+            time_t now = monotonic_sec();
+
+            if (bd_power_hold_until != 0 && now < bd_power_hold_until)
+            {
+                int wait_sec = (int)(bd_power_hold_until - now);
+
+                if (wait_sec > MAIN_SEND_RETRY_WAIT_SEC)
+                    wait_sec = MAIN_SEND_RETRY_WAIT_SEC;
+
+                main_wait_for_data_wakeup(&wakeup_seq_seen, wait_sec);
+                state = MAIN_ST_IDLE;
+                break;
+            }
+
+            bd_power_hold_until = 0;
             printf("[MAIN] Power down and wait for new data\n");
 
             main_all_power_down(&eg_initialized,

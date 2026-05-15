@@ -27,6 +27,7 @@
 #define LORA_MAX_HEX_LEN 256
 #define BD_FAIL_MAX 3
 #define MAIN_4G_COOLDOWN_SEC 60
+#define BD_POWER_HOLD_SEC 30
 typedef enum
 {
     MAIN_ST_IDLE = 0,
