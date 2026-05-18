@@ -3,7 +3,7 @@
 #include "../inc/bluetooth.h"
 #include <stdatomic.h>
 #include "../inc/power.h"
-#define THREAD_COUNT 10
+#define THREAD_COUNT 9
 typedef void *(*thread_func_t)(void *);
 volatile sig_atomic_t stop_flag = 0;
 struct kfifo data_fifo;
@@ -151,13 +151,13 @@ int main(int argc, char *argv[])
         main_send_thread,
         lora_transform_thread,
         eg_monitor_thread,
-        watchdog_feed_thread,
+        // watchdog_feed_thread,
         bt_comm_thread,
         lora_receive_thread,
         serial_send_thread,
     };
     void *thread_args[THREAD_COUNT] = {
-        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &my_lora_config};
+        NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, &my_lora_config};
     pthread_t tids[THREAD_COUNT];
     int created_count = 0;
     int ret = 1; // 默认失败
@@ -189,7 +189,7 @@ cleanup:
             "main_send_thread",
             "lora_transform_thread",
             "eg_monitor_thread",
-            "watchdog_feed_thread",
+            // "watchdog_feed_thread",
             "bt_comm_thread",
             "lora_receive_thread",
         };

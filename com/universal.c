@@ -691,3 +691,58 @@ time_t monotonic_sec(void)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec;
 }
+
+void trim_log_file_by_size(const char *path)
+{
+    FILE *fp = NULL;
+    FILE *out = NULL;
+    long size = 0;
+    char tmp_path[256];
+    char buf[4096];
+
+    fp = fopen(path, "rb");
+    if (!fp)
+        return;
+
+    if (fseek(fp, 0, SEEK_END) != 0)
+    {
+        fclose(fp);
+        return;
+    }
+
+    size = ftell(fp);
+    if (size < LOG_MAX_SIZE)
+    {
+        fclose(fp);
+        return;
+    }
+
+    if (fseek(fp, size - LOG_KEEP_TAIL_SIZE, SEEK_SET) != 0)
+    {
+        fclose(fp);
+        return;
+    }
+
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", path);
+    out = fopen(tmp_path, "wb");
+    if (!out)
+    {
+        fclose(fp);
+        return;
+    }
+
+    while (!feof(fp))
+    {
+        size_t n = fread(buf, 1, sizeof(buf), fp);
+        if (n > 0)
+            fwrite(buf, 1, n, out);
+    }
+
+    fflush(out);
+    fsync(fileno(out));
+
+    fclose(out);
+    fclose(fp);
+
+    rename(tmp_path, path);
+}

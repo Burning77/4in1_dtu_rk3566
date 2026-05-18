@@ -34,6 +34,8 @@
 #define LORA_MESH_ROOT 0xff
 #define LORA_MESH_NOTROOT 0x00
 #define DEBUG
+#define LOG_MAX_SIZE (5 * 1024 * 1024)
+#define LOG_KEEP_TAIL_SIZE (1 * 1024 * 1024)
 typedef struct
 {
     int type;                  // RS485_DATA 或 RS232_DATA
@@ -89,4 +91,5 @@ int push_lora_to_fifo(frame_processor_ctx_t *ctx, const uint8_t *data, uint8_t l
 uint32_t log_next_frame_id(void);
 int compact_log_file(const char *path, off_t *offset, int keep_frames);
 time_t monotonic_sec(void);
+void trim_log_file_by_size(const char *path);
 #endif

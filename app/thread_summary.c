@@ -966,10 +966,20 @@ void *write_file_thread(void *arg)
         fflush(fp);
         fsync(fileno(fp));
         fclose(fp);
-
         if (msg.type == RS485_DATA || msg.type == BT_DATA)
         {
             notify_data_wakeup(msg.type == RS485_DATA ? "RS485" : "BT");
+        }
+        static unsigned int bd_log_trim_count = 0;
+
+        if (msg.type == BD_DATA)
+        {
+            bd_log_trim_count++;
+            if (bd_log_trim_count >= 100)
+            {
+                bd_log_trim_count = 0;
+                trim_log_file_by_size(BD_LOG_PATH);
+            }
         }
     }
     return NULL;
@@ -1703,19 +1713,19 @@ void *main_send_thread(void *arg)
     return NULL;
 }
 
-void *watchdog_feed_thread(void *arg)
-{
-    // while (!stop_flag)
-    // {
-    //     // if (watchdog_fd != -1)
-    //     // {
-    //     //     if (write(watchdog_fd, "\0", 1) != 1)
-    //     //     {
-    //     //         perror("watchdog write");
-    //     //     }
-    //     // }
-    //     // if (interruptible_sleep(5) < 0)
-    //     //     break;
-    // }
-    return NULL;
-}
+// void *watchdog_feed_thread(void *arg)
+// {
+//     while (!stop_flag)
+//     {
+//         if (watchdog_fd != -1)
+//         {
+//             if (write(watchdog_fd, "\0", 1) != 1)
+//             {
+//                 perror("watchdog write");
+//             }
+//         }
+//         if (interruptible_sleep(5) < 0)
+//             break;
+//     }
+//     return NULL;
+// }
